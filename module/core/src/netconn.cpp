@@ -2,13 +2,17 @@
 #include "logger.hpp"
 
 #include <iostream>
+#include <limits>
 #include <boost/beast/http.hpp>
 #include <boost/beast/websocket.hpp>
+#include <boost/beast/ssl.hpp>
+#include <boost/asio/ssl.hpp>
 
 namespace asio  = boost::asio;
 namespace beast = boost::beast;
 namespace http  = beast::http;
 namespace websocket = beast::websocket;
+namespace ssl   = boost::asio::ssl;
 using tcp = asio::ip::tcp;
 
 static std::string buildTarget(const ParsedUrl& pu)
@@ -561,6 +565,73 @@ void NetConn::wsClose()
         m_ws->close();
         m_ws.reset();
     }
+}
+
+// ==================== HTTPS streaming POST ====================
+
+std::string httpsPostStream(
+    const std::string& host,
+    const std::string& port,
+    const std::string& target,
+    const std::string& body,
+    const std::string& content_type,
+    const std::string& authorization,
+    std::function<void(const std::string&)> on_chunk,
+    std::chrono::milliseconds timeout)
+{
+    asio::io_context io;
+    ssl::context ctx(ssl::context::tlsv12_client);
+    ctx.set_verify_mode(ssl::verify_peer);
+    ctx.set_default_verify_paths();
+
+    tcp::resolver resolver(io);
+    auto results = resolver.resolve(host, port);
+
+    beast::ssl_stream<beast::tcp_stream> stream(io, ctx);
+    stream.next_layer().expires_after(timeout);
+    beast::get_lowest_layer(stream).connect(results);
+    stream.handshake(ssl::stream_base::client);
+
+    http::request<http::string_body> req(http::verb::post, target, 11);
+    req.set(http::field::host, host);
+    req.set(http::field::content_type, content_type);
+    req.set(http::field::connection, "close");
+    if (!authorization.empty())
+        req.set(http::field::authorization, authorization);
+    req.body() = body;
+    req.prepare_payload();
+    http::write(stream, req);
+
+    beast::flat_buffer buf;
+    http::response_parser<http::string_body> parser;
+    parser.body_limit(std::numeric_limits<uint64_t>::max());
+    http::read_header(stream, buf, parser);
+
+    int status = parser.get().result_int();
+    if (status != 200)
+    {
+        beast::error_code ec;
+        http::read(stream, buf, parser, ec);
+        std::string err_body = parser.get().body();
+        throw std::runtime_error("HTTPS error " + std::to_string(status) + ": " + err_body);
+    }
+
+    std::string full;
+    while (!parser.is_done())
+    {
+        auto prev = parser.get().body().size();
+        beast::error_code ec;
+        http::read_some(stream, buf, parser, ec);
+        if (ec == http::error::end_of_stream) break;
+        if (ec) throw beast::system_error(ec);
+        std::string chunk = parser.get().body().substr(prev);
+        if (!chunk.empty())
+        {
+            if (on_chunk) on_chunk(chunk);
+            full += chunk;
+        }
+    }
+    return full;
 }
 
 extern "C"

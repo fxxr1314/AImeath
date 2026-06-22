@@ -90,3 +90,17 @@ private:
     mutable std::mutex m_ws_mtx;
     std::shared_ptr<WsState> m_ws;
 };
+
+// Synchronous HTTPS POST with streaming chunk callback.
+// Calls on_chunk(data) for each body chunk as it arrives.
+// Returns the full response body. Throws std::runtime_error on failure.
+// timeout: maximum time for any single I/O operation.
+std::string httpsPostStream(
+    const std::string& host,
+    const std::string& port,
+    const std::string& target,
+    const std::string& body,
+    const std::string& content_type,
+    const std::string& authorization,
+    std::function<void(const std::string&)> on_chunk,
+    std::chrono::milliseconds timeout = std::chrono::seconds(30));
