@@ -10,11 +10,12 @@ add_subdirectory(module/snake)
 add_subdirectory(module/gomoku)
 add_subdirectory(module/pacman)
 add_subdirectory(module/go)
+add_subdirectory(module/chat)
 add_subdirectory(backend)
 
 add_executable(demo main.cpp)
 target_include_directories(demo PRIVATE module/game/include module/core/include)
-target_link_libraries(demo game core)
+target_link_libraries(demo game core dl)
 add_dependencies(demo game snake gomoku pacman go)
 
 # 让运行 demo 时 dlopen 能找到 .so

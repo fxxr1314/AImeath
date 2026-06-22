@@ -2,6 +2,7 @@
 #include <iostream>
 #include <thread>
 #include <chrono>
+#include <dlfcn.h>
 
 extern "C" void run_netconn_demo();
 
@@ -100,6 +101,38 @@ static void run_go()
     std::cout << "Final Score (1=B win, 2=W win): " << game->score() << std::endl;
 }
 
+static char* meow(const char* text)
+{
+    std::string s(text);
+    s += "\xe5\x96\xb5";
+    char* buf = static_cast<char*>(std::malloc(s.size() + 1));
+    if (buf) std::memcpy(buf, s.data(), s.size() + 1);
+    return buf;
+}
+
+static void run_chat()
+{
+    void* lib = dlopen("libchat.so", RTLD_NOW | RTLD_LOCAL);
+    if (!lib) { std::cerr << "chat: " << dlerror() << std::endl; return; }
+
+    auto chat_new     = reinterpret_cast<void* (*)(char* (*)(const char*))>(dlsym(lib, "chat_new"));
+    auto chat_free    = reinterpret_cast<void  (*)(void*)>(dlsym(lib, "chat_free"));
+    auto chat_process = reinterpret_cast<char* (*)(void*, const char*)>(dlsym(lib, "chat_process"));
+
+    void* chat = chat_new(meow);
+    char* r1 = chat_process(chat, "Hello");
+    char* r2 = chat_process(chat, "你好世界");
+
+    std::cout << "=== Chat ===" << std::endl;
+    std::cout << "Hello -> " << r1 << std::endl;
+    std::cout << "你好世界 -> " << r2 << std::endl;
+
+    std::free(r1);
+    std::free(r2);
+    chat_free(chat);
+    dlclose(lib);
+}
+
 static void run_netconn()
 {
     std::cout << "=== NetConn (Core) ===" << std::endl;
@@ -109,6 +142,7 @@ static void run_netconn()
 int main()
 {
     run_netconn();
+    run_chat();
     run_pacman();
     run_gomoku();
     run_snake();
