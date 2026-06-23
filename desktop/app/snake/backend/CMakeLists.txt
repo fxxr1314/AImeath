@@ -16,14 +16,12 @@ add_library(snake SHARED
     src/snake.cpp
     src/board.cpp
     src/game.cpp
+    ${CMAKE_SOURCE_DIR}/desktop/app/shared/game/src/game_app_adapter.cpp
 )
 target_include_directories(snake PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_include_directories(snake PRIVATE ${CMAKE_SOURCE_DIR}/module/app/include)
+target_include_directories(snake PRIVATE ${CMAKE_SOURCE_DIR}/desktop/app/shared/game/include)
 target_link_libraries(snake PRIVATE Boost::json)
-if(TARGET game)
-    target_link_libraries(snake PRIVATE game)
-else()
-    target_include_directories(snake PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../../../module/game/include)
-endif()
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 find_package(GTest REQUIRED)
@@ -32,15 +30,15 @@ add_executable(tests
 )
 set_target_properties(tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output/test)
 target_link_libraries(tests snake GTest::GTest GTest::Main)
-if(TARGET game)
-    target_link_libraries(tests PRIVATE game)
-endif()
 target_include_directories(tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_include_directories(tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../../../module/game/include)
+target_include_directories(tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../../../module/app/include)
+target_include_directories(tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../../../shared/game/include)
 
 find_package(benchmark REQUIRED)
 add_executable(bench_snake benchmark/snake_bench.cpp)
 set_target_properties(bench_snake PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output/bench)
 target_link_libraries(bench_snake snake benchmark::benchmark)
 target_include_directories(bench_snake PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_include_directories(bench_snake PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../../../module/app/include)
+target_include_directories(bench_snake PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../../../shared/game/include)
 endif()

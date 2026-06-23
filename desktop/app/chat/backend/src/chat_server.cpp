@@ -1,0 +1,320 @@
+#include <app_api.hpp>
+
+#include <iostream>
+#include <string>
+#include <vector>
+#include <sstream>
+#include <fstream>
+#include <cstdlib>
+#include <cstring>
+
+#include <boost/json.hpp>
+
+#include "netconn.hpp"
+
+// ---- ChatApp state ----
+
+struct ChatApp
+{
+    std::vector<boost::json::object> history;
+    bool done = false;
+};
+
+// ---- DeepSeek streaming (accumulates into a JSON array) ----
+
+static std::string loadDeepSeekApiKey()
+{
+    std::ifstream f("config.json");
+    if (!f.is_open())
+    {
+        std::cerr << "WARNING: config.json not found" << std::endl;
+        return "";
+    }
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    try
+    {
+        auto val = boost::json::parse(content);
+        auto& obj = val.as_object();
+        if (obj.contains("deepseek_api_key"))
+            return obj["deepseek_api_key"].as_string().c_str();
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << "WARNING: failed to parse config.json: " << e.what() << std::endl;
+    }
+    return "";
+}
+
+/// Call DeepSeek and return a JSON array of output messages
+/// (stream_start, delta..., stream_end)
+static boost::json::array callDeepSeek(
+    const std::vector<boost::json::object>& history)
+{
+    boost::json::array outputs;
+    boost::json::object start;
+    start["type"] = "stream_start";
+    outputs.push_back(start);
+
+    boost::json::array msgs;
+    for (const auto& m : history) msgs.push_back(m);
+
+    boost::json::object body;
+    body["model"] = "deepseek-v4-flash";
+    body["messages"] = msgs;
+    body["stream"] = true;
+    body["thinking"] = {{"type", "disabled"}};
+
+    std::string apiKey = loadDeepSeekApiKey();
+    if (apiKey.empty())
+    {
+        boost::json::object end;
+        end["type"] = "stream_end";
+        end["msg"]  = "missing deepseek_api_key in config.json";
+        outputs.push_back(end);
+        return outputs;
+    }
+
+    std::string full_response;
+    std::string leftover;
+
+    auto on_chunk = [&](const std::string& chunk)
+    {
+        leftover += chunk;
+        size_t pos;
+        while ((pos = leftover.find("\n\n")) != std::string::npos)
+        {
+            std::string event = leftover.substr(0, pos);
+            leftover.erase(0, pos + 2);
+
+            std::istringstream ss(event);
+            std::string line;
+            while (std::getline(ss, line))
+            {
+                if (line.rfind("data: ", 0) != 0) continue;
+                std::string data = line.substr(6);
+                if (data == "[DONE]") continue;
+                try
+                {
+                    auto val = boost::json::parse(data);
+                    auto& choices = val.as_object().at("choices").as_array();
+                    if (choices.empty()) continue;
+                    auto& delta = choices[0].as_object().at("delta").as_object();
+                    if (!delta.contains("content")) continue;
+                    std::string content = delta.at("content").as_string().c_str();
+                    full_response += content;
+                    boost::json::value push_val = {{"type", "delta"}, {"text", content}};
+                    outputs.push_back(push_val);
+                }
+                catch (const std::exception&) {}
+            }
+        }
+    };
+
+    try
+    {
+        httpsPostStream(
+            "api.deepseek.com", "443", "/chat/completions",
+            boost::json::serialize(body), "application/json",
+            "Bearer " + apiKey,
+            on_chunk
+        );
+        // Process remaining data after stream ends
+        size_t pos;
+        while ((pos = leftover.find("\n\n")) != std::string::npos)
+        {
+            std::string event = leftover.substr(0, pos);
+            leftover.erase(0, pos + 2);
+            std::istringstream ss(event);
+            std::string line;
+            while (std::getline(ss, line))
+            {
+                if (line.rfind("data: ", 0) != 0) continue;
+                std::string data = line.substr(6);
+                if (data == "[DONE]") continue;
+                try
+                {
+                    auto val = boost::json::parse(data);
+                    auto& choices = val.as_object().at("choices").as_array();
+                    if (choices.empty()) continue;
+                    auto& delta = choices[0].as_object().at("delta").as_object();
+                    if (!delta.contains("content")) continue;
+                    std::string content = delta.at("content").as_string().c_str();
+                    full_response += content;
+                    boost::json::value push_val = {{"type", "delta"}, {"text", content}};
+                    outputs.push_back(push_val);
+                }
+                catch (const std::exception&) {}
+            }
+        }
+    }
+    catch (const std::exception& e)
+    {
+        std::string what = e.what();
+        if (what.find("eof") == std::string::npos &&
+            what.find("end of stream") == std::string::npos)
+        {
+            boost::json::object end_val;
+            end_val["type"] = "stream_end";
+            end_val["msg"] = what;
+            outputs.push_back(end_val);
+            return outputs;
+        }
+    }
+
+    boost::json::object end;
+    end["type"] = "stream_end";
+    outputs.push_back(end);
+    return outputs;
+}
+
+// ---- Command handling (returns array of output messages) ----
+
+static boost::json::array handleCommand(const std::string& text)
+{
+    std::string s = text.substr(1);
+
+    size_t end = s.find_last_not_of(" \t");
+    if (end != std::string::npos) s = s.substr(0, end + 1);
+
+    size_t pos = s.find_first_of(" \t");
+    std::string cmd = (pos == std::string::npos) ? s : s.substr(0, pos);
+    std::string arg;
+    if (pos != std::string::npos) {
+        arg = s.substr(pos + 1);
+        size_t first = arg.find_first_not_of(" \t");
+        if (first != std::string::npos) arg = arg.substr(first);
+    }
+
+    boost::json::object embed;
+    embed["type"] = "embed";
+
+    if (s == "图片")
+    {
+        embed["kind"] = "image";
+        embed["url"]  = "/res/C220748556D18ADBC61177B1A5A8151D.png";
+        embed["title"]= "照片";
+    }
+    else if (s == "视频")
+    {
+        embed["kind"] = "video";
+        embed["url"]  = "/res/result.mp4";
+        embed["title"]= "视频";
+    }
+    else if (s == "音乐")
+    {
+        embed["kind"] = "audio";
+        embed["url"]  = "/res/超级敏感.wav";
+        embed["title"]= "超级敏感";
+    }
+    else if (cmd == "游戏" || s.rfind("游戏", 0) == 0)
+    {
+        std::string game;
+        if (cmd == "游戏")
+            game = arg;
+        else if (s.size() > 6)
+            game = s.substr(6);
+        if (game.empty()) game = "snake";
+        embed["kind"] = "game";
+        embed["name"] = game;
+        embed["url"]  = "/" + game;
+        embed["title"]= "游戏：" + game;
+    }
+    else
+    {
+        embed["kind"] = "text";
+        embed["text"] = "未知命令: /" + cmd;
+    }
+
+    boost::json::array result;
+    result.push_back(embed);
+    return result;
+}
+
+// ---- Unified App C ABI ----
+
+extern "C"
+{
+
+void* app_create(const char* config_json)
+{
+    (void)config_json;
+    return new ChatApp();
+}
+
+void app_destroy(void* p)
+{
+    delete static_cast<ChatApp*>(p);
+}
+
+char* app_process(void* p, const char* input_json)
+{
+    auto* app = static_cast<ChatApp*>(p);
+
+    boost::json::array outputs;
+    std::string msg(input_json);
+
+    std::string text;
+    try {
+        auto val = boost::json::parse(msg);
+        if (val.is_object()) {
+            auto& obj = val.as_object();
+            auto it = obj.find("text");
+            if (it != obj.end() && it->value().is_string())
+                text = std::string(it->value().as_string());
+        }
+    } catch (...) {}
+
+    if (!text.empty())
+    {
+        if (text[0] == '/')
+        {
+            outputs = handleCommand(text);
+        }
+        else
+        {
+            boost::json::object user_msg;
+            user_msg["role"] = "user";
+            user_msg["content"] = text;
+            app->history.push_back(user_msg);
+
+            outputs = callDeepSeek(app->history);
+
+            // Build full response string from delta messages
+            std::string full;
+            for (auto& item : outputs)
+            {
+                if (item.is_object())
+                {
+                    auto& obj = item.as_object();
+                    auto it = obj.find("text");
+                    if (it != obj.end() && it->value().is_string())
+                        full += std::string(it->value().as_string());
+                }
+            }
+            if (!full.empty())
+            {
+                boost::json::object assistant_msg;
+                assistant_msg["role"] = "assistant";
+                assistant_msg["content"] = full;
+                app->history.push_back(assistant_msg);
+            }
+        }
+    }
+
+    std::string result = boost::json::serialize(outputs);
+    char* buf = static_cast<char*>(std::malloc(result.size() + 1));
+    if (buf) std::memcpy(buf, result.data(), result.size() + 1);
+    return buf;
+}
+
+void app_free_string(char* str)
+{
+    std::free(str);
+}
+
+int app_is_done(void* p)
+{
+    return static_cast<ChatApp*>(p)->done ? 1 : 0;
+}
+
+} // extern "C"

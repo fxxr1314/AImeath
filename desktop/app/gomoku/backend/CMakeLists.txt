@@ -15,14 +15,12 @@ find_package(Boost REQUIRED COMPONENTS json)
 add_library(gomoku SHARED
     src/board.cpp
     src/game.cpp
+    ${CMAKE_SOURCE_DIR}/desktop/app/shared/game/src/game_app_adapter.cpp
 )
 target_include_directories(gomoku PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_include_directories(gomoku PRIVATE ${CMAKE_SOURCE_DIR}/module/app/include)
+target_include_directories(gomoku PRIVATE ${CMAKE_SOURCE_DIR}/desktop/app/shared/game/include)
 target_link_libraries(gomoku PRIVATE Boost::json)
-if(TARGET game)
-    target_link_libraries(gomoku PRIVATE game)
-else()
-    target_include_directories(gomoku PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../../../module/game/include)
-endif()
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 find_package(GTest REQUIRED)
@@ -31,11 +29,8 @@ add_executable(tests
 )
 set_target_properties(tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output/test)
 target_link_libraries(tests gomoku GTest::GTest GTest::Main)
-if(TARGET game)
-    target_link_libraries(tests PRIVATE game)
-endif()
 target_include_directories(tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_include_directories(tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../../../module/game/include)
+target_include_directories(tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../../../shared/game/include)
 
 find_package(benchmark REQUIRED)
 add_executable(bench_gomoku benchmark/gomoku_bench.cpp)

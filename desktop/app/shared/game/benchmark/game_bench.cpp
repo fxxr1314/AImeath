@@ -1,5 +1,4 @@
 #include <benchmark/benchmark.h>
-#include "direction.hpp"
 #include "game_base.hpp"
 
 class BenchGame : public Game
@@ -20,24 +19,5 @@ static void BM_GameVirtualTick(benchmark::State& state)
         g.tick(1);
 }
 BENCHMARK(BM_GameVirtualTick);
-
-static void BM_DirectionIsOpposite(benchmark::State& state)
-{
-    for (auto _ : state)
-        benchmark::DoNotOptimize(isOppositeDir(Direction::UP, Direction::DOWN));
-}
-BENCHMARK(BM_DirectionIsOpposite);
-
-static void BM_DirectionApplyDir(benchmark::State& state)
-{
-    int x = 0, y = 0;
-    for (auto _ : state)
-    {
-        applyDir(Direction::RIGHT, x, y);
-        benchmark::DoNotOptimize(x);
-        benchmark::DoNotOptimize(y);
-    }
-}
-BENCHMARK(BM_DirectionApplyDir);
 
 BENCHMARK_MAIN();

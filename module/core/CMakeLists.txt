@@ -35,11 +35,7 @@ add_executable(tests
     test/netconn_test.cpp
 )
 set_target_properties(tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output/test)
-target_link_libraries(tests
-    core
-    GTest::GTest
-    GTest::Main
-)
+target_link_libraries(tests core GTest::GTest GTest::Main)
 target_include_directories(tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 find_package(benchmark REQUIRED)
