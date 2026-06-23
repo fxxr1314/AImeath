@@ -83,15 +83,15 @@ static void handleClient(tcp::socket socket)
             if (!val.is_object()) { ws.write(asio::buffer("[]")); return; }
             auto& obj = val.as_object();
 
-            auto it = obj.find("text");
+            auto it = obj.find("app");
             if (it != obj.end() && it->value().is_string()) {
+                app_name = std::string(it->value().as_string());
+            } else if ((it = obj.find("text")) != obj.end() && it->value().is_string()) {
                 app_name = "chat";
+            } else if ((it = obj.find("game")) != obj.end() && it->value().is_string()) {
+                app_name = std::string(it->value().as_string());
             } else {
-                it = obj.find("game");
-                if (it != obj.end() && it->value().is_string())
-                    app_name = std::string(it->value().as_string());
-                else
-                    app_name = "snake"; // fallback
+                app_name = "snake"; // fallback
             }
         } catch (...) {
             ws.write(asio::buffer("[]"));

@@ -31,14 +31,14 @@
           <span class="win-title-text">{{ win.name }}</span>
           <div class="win-controls">
             <button class="ctrl-btn ctrl-min" @mousedown.stop @click="minimizeWindow(id)">─</button>
-            <button class="ctrl-btn ctrl-max" @mousedown.stop @click="toggleMaximize(id)">☐</button>
+            <button v-if="!win.fixed" class="ctrl-btn ctrl-max" @mousedown.stop @click="toggleMaximize(id)">☐</button>
             <button class="ctrl-btn ctrl-close" @mousedown.stop @click="closeWindow(id)">✕</button>
           </div>
         </div>
         <div class="win-body">
           <iframe :src="win.src" frameborder="0"></iframe>
         </div>
-        <template v-if="!win.maximized">
+        <template v-if="!win.maximized && !win.fixed">
           <div class="rh rh-n" @mousedown.stop="startResize(id, $event, 'n')"></div>
           <div class="rh rh-s" @mousedown.stop="startResize(id, $event, 's')"></div>
           <div class="rh rh-e" @mousedown.stop="startResize(id, $event, 'e')"></div>
@@ -116,9 +116,10 @@ function iframeSrc(url) {
   return `${base}/#${url}`
 }
 
-function openApp(app) {
+function openApp(app, opts) {
   const count = Object.keys(windows).length
   const cascade = (count * 30) % 240
+  const fixed = opts?.fixed
   const id = `w${winIdSeq++}`
   windows[id] = {
     name: app.name,
@@ -127,8 +128,9 @@ function openApp(app) {
     src: iframeSrc(app.url),
     x: 40 + cascade,
     y: 40 + cascade,
-    w: 820,
-    h: 540,
+    w: fixed ? 560 : 820,
+    h: fixed ? 170 : 540,
+    fixed: !!fixed,
     zIndex: ++zSeq,
     minimized: false,
     maximized: false,
@@ -145,7 +147,7 @@ function minimizeWindow(id) {
 
 function toggleMaximize(id) {
   const w = windows[id]
-  if (w.maximized) {
+  if (w.fixed || w.maximized) {
     w.x = w._x
     w.y = w._y
     w.w = w._w
@@ -204,7 +206,7 @@ function startDrag(id, e) {
 
 function startResize(id, e, dir) {
   const w = windows[id]
-  if (w.maximized) return
+  if (w.maximized || w.fixed) return
   drag.value = { id, t: 'resize', dir, sx: e.clientX, sy: e.clientY, lx: w.x, ly: w.y, lw: w.w, lh: w.h }
   document.addEventListener('mousemove', onDrag)
   document.addEventListener('mouseup', endDrag)
@@ -249,7 +251,25 @@ function updateClock() {
 
 function goHome() { router.push('/') }
 
-onMounted(() => { updateClock(); timer = setInterval(updateClock, 1000) })
+function onPostMessage(e) {
+  if (e.data?.type === 'openFile') {
+    openApp({
+      name: e.data.name,
+      icon: '<svg viewBox="0 0 48 48" width="18" height="18"><path d="M8 6h16l8 8v28H8V6z" fill="#4fc3f7"/><path d="M24 6v8h8" fill="#29b6f6"/></svg>',
+      url: `/view?url=${encodeURIComponent(e.data.url)}&name=${encodeURIComponent(e.data.name)}&kind=${e.data.kind}`,
+    }, e.data.kind === 'audio' ? { fixed: true } : undefined)
+  }
+}
+
+onMounted(() => {
+  updateClock()
+  timer = setInterval(updateClock, 1000)
+  window.addEventListener('message', onPostMessage)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('message', onPostMessage)
+})
 
 onUnmounted(() => {
   if (timer) clearInterval(timer)
