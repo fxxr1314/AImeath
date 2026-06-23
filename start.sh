@@ -22,7 +22,7 @@ sleep 1
 
 echo ""
 echo "=== Starting Frontend (port 5173) ==="
-cd frontend
+cd desktop
 npm run dev &
 VITE_PID=$!
 echo "Vite PID: $VITE_PID"
