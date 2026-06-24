@@ -34,7 +34,13 @@
             {{ m.text }}
           </div>
         </div>
-        <div v-else class="bubble" v-html="renderMarkdown(m.text)"></div>
+        <div v-else class="bubble">
+          <details v-if="m.reasoning" class="reasoning-block" :open="false">
+            <summary class="reasoning-summary">💭 思考过程</summary>
+            <div class="reasoning-content">{{ m.reasoning }}</div>
+          </details>
+          <div v-html="renderMarkdown(m.text)"></div>
+        </div>
       </div>
     </main>
     <footer class="chat-footer">
@@ -69,6 +75,10 @@ const input = ref('')
 const messages = ref([])
 const connected = ref(false)
 const streamingIdx = ref(-1)
+let pollTimer = null
+let deltaBuffer = ''
+let reasoningBuffer = ''
+let rafPending = false
 
 const statusText = computed(() => connected.value ? '已连接' : '未连接')
 const statusClass = computed(() => connected.value ? 'status-ok' : 'status-err')
@@ -79,22 +89,65 @@ const ch = createChannel(WS_URL, { maxRetries: -1, retryDelay: 3000, retryBackof
 
 ch.onOpen(() => { connected.value = true })
 ch.onError(() => { connected.value = false })
-ch.onClose(() => { connected.value = false })
+ch.onClose(() => { connected.value = false; clearStream(); stopPoll() })
+
+function stopPoll() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
+}
+
+function clearStream() {
+  deltaBuffer = ''
+  reasoningBuffer = ''
+  rafPending = false
+}
+
+function flushStream() {
+  rafPending = false
+  if (streamingIdx.value < 0) return
+  let changed = false
+  if (deltaBuffer) {
+    messages.value[streamingIdx.value].text += deltaBuffer
+    deltaBuffer = ''
+    changed = true
+  }
+  if (reasoningBuffer) {
+    messages.value[streamingIdx.value].reasoning += reasoningBuffer
+    reasoningBuffer = ''
+    changed = true
+  }
+  if (changed) scrollBottom()
+}
+
+function scheduleFlush() {
+  if (!rafPending) {
+    rafPending = true
+    requestAnimationFrame(flushStream)
+  }
+}
 
 ch.onMessage((data) => {
   if (data.type === 'embed') {
     messages.value.push({ isSelf: false, type: 'embed', kind: data.kind, url: data.url, title: data.title, name: data.name, text: data.text || '' })
     scrollBottom()
   } else if (data.type === 'stream_start') {
-    messages.value.push({ text: '', isSelf: false })
+    messages.value.push({ text: '', reasoning: '', isSelf: false })
     streamingIdx.value = messages.value.length - 1
     scrollBottom()
+    startPoll()
+  } else if (data.type === 'reasoning') {
+    if (streamingIdx.value >= 0) {
+      reasoningBuffer += data.text
+      scheduleFlush()
+    }
   } else if (data.type === 'delta') {
     if (streamingIdx.value >= 0) {
-      messages.value[streamingIdx.value].text += data.text
-      scrollBottom()
+      deltaBuffer += data.text
+      scheduleFlush()
     }
   } else if (data.type === 'stream_end') {
+    if (deltaBuffer || reasoningBuffer) flushStream()
+    clearStream()
+    stopPoll()
     if (data.msg && streamingIdx.value >= 0) {
       messages.value[streamingIdx.value].text = '⚠️ ' + data.msg
     }
@@ -105,6 +158,11 @@ ch.onMessage((data) => {
     scrollBottom()
   }
 })
+
+function startPoll() {
+  stopPoll()
+  pollTimer = setInterval(() => ch.send({ action: 'poll' }), 50)
+}
 
 function wrapMermaid(el) {
   const source = el.getAttribute('data-source') || ''
@@ -369,7 +427,12 @@ onBeforeUnmount(() => ch.close())
 
 .embed-audio {
   width: 100%;
+  min-width: 280px;
   height: 40px;
+}
+
+.bubble-audio {
+  max-width: 95%;
 }
 
 .embed-title {
@@ -518,5 +581,34 @@ onBeforeUnmount(() => ch.close())
 }
 .bubble :deep(.mermaid-wrapper.show-source .mermaid > svg) {
   display: none;
+}
+
+/* Reasoning / thinking block */
+.reasoning-block {
+  margin-bottom: 8px;
+  font-size: 13px;
+  border-left: 3px solid #9ca3af;
+  padding-left: 10px;
+}
+
+.reasoning-summary {
+  cursor: pointer;
+  color: #6b7280;
+  font-weight: 500;
+  user-select: none;
+  padding: 2px 0;
+}
+
+.reasoning-summary:hover {
+  color: #4b5563;
+}
+
+.reasoning-content {
+  margin-top: 6px;
+  color: #6b7280;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 </style>

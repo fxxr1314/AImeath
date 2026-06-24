@@ -1,184 +1,151 @@
 #include <iostream>
-#include <thread>
-#include <chrono>
-#include <cstdlib>
-#include <cstring>
 #include <string>
+#include <thread>
+#include <memory>
 
+#include <boost/asio.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
+#include <boost/beast/websocket.hpp>
 #include <boost/json.hpp>
 
 #include "app_mod.hpp"
 
-extern "C" void run_netconn_demo();
+namespace asio  = boost::asio;
+namespace beast = boost::beast;
+namespace http  = beast::http;
+namespace websocket = beast::websocket;
+using tcp = asio::ip::tcp;
 
-// ---- Game runners using unified C ABI ----
+// ---- Generic app handler (works with any app .so) ----
 
-static AppModuleCache s_cache;
-
-static void run_snake()
+static void handleApp(websocket::stream<beast::tcp_stream>& ws,
+                      const std::string& first_msg,
+                      AppModule& mod, void* app)
 {
-    auto m = s_cache.load("snake");
-    if (!m) { std::cerr << "snake: load failed" << std::endl; return; }
-
-    auto app = m.create(R"({"action":"new_game","width":20,"height":20})");
-    if (!app) { std::cerr << "snake: create failed" << std::endl; return; }
-
-    int dir = 3; // right
-    for (int i = 0; i < 50; ++i)
+    // Process the first message
+    char* out = mod.app_process(app, first_msg.c_str());
+    if (out)
     {
-        if (m.app_is_done(app.get())) break;
-
-        boost::json::object tick;
-        tick["action"] = "tick";
-        tick["value"]  = dir;
-        std::string msg = boost::json::serialize(tick);
-
-        char* out = m.app_process(app.get(), msg.c_str());
-        if (out) m.app_free_string(out);
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        try {
+            auto arr = boost::json::parse(out).as_array();
+            for (auto& item : arr)
+                ws.write(asio::buffer(boost::json::serialize(item)));
+        } catch (...) {}
+        mod.app_free_string(out);
     }
 
-    // Get final state
-    if (!m.app_is_done(app.get()))
+    // Loop for subsequent messages
+    beast::flat_buffer buf;
+    while (!mod.app_is_done(app))
     {
-        boost::json::object end;
-        end["action"] = "end_game";
-        char* out = m.app_process(app.get(), boost::json::serialize(end).c_str());
-        if (out) m.app_free_string(out);
-    }
+        buf.clear();
+        ws.read(buf);
+        std::string msg = beast::buffers_to_string(buf.data());
 
-    std::cout << "=== Snake ===" << std::endl;
-    std::cout << "Done" << std::endl;
-}
-
-static void run_gomoku()
-{
-    auto m = s_cache.load("gomoku");
-    if (!m) { std::cerr << "gomoku: load failed" << std::endl; return; }
-
-    auto app = m.create(R"({"action":"new_game","width":15,"height":15})");
-    if (!app) { std::cerr << "gomoku: create failed" << std::endl; return; }
-
-    int moves[] = { 3*15+7, 0*15+0, 4*15+7, 1*15+0, 5*15+7, 2*15+0, 6*15+7, 3*15+1, 7*15+7 };
-
-    for (int pos : moves)
-    {
-        if (m.app_is_done(app.get())) break;
-
-        boost::json::object tick;
-        tick["action"] = "tick";
-        tick["value"]  = pos;
-        char* out = m.app_process(app.get(), boost::json::serialize(tick).c_str());
-        if (out) m.app_free_string(out);
-    }
-
-    std::cout << "=== Gomoku ===" << std::endl;
-    std::cout << "Done" << std::endl;
-}
-
-static void run_pacman()
-{
-    auto m = s_cache.load("pacman");
-    if (!m) { std::cerr << "pacman: load failed" << std::endl; return; }
-
-    auto app = m.create(R"({"action":"new_game","width":20,"height":20})");
-    if (!app) { std::cerr << "pacman: create failed" << std::endl; return; }
-
-    int steps_in_dir = 5;
-    int dirs[] = { 3, 2, 1, 2 }; // right, down, left, down
-    for (int phase = 0; phase < 8; ++phase)
-    {
-        if (m.app_is_done(app.get())) break;
-        int d = dirs[phase % 4];
-        for (int i = 0; i < steps_in_dir; ++i)
+        out = mod.app_process(app, msg.c_str());
+        if (out)
         {
-            if (m.app_is_done(app.get())) break;
-            boost::json::object tick;
-            tick["action"] = "tick";
-            tick["value"]  = d;
-            char* out = m.app_process(app.get(), boost::json::serialize(tick).c_str());
-            if (out) m.app_free_string(out);
+            try {
+                auto arr = boost::json::parse(out).as_array();
+                for (auto& item : arr)
+                    ws.write(asio::buffer(boost::json::serialize(item)));
+            } catch (...) {}
+            mod.app_free_string(out);
         }
     }
-
-    std::cout << "=== Pac-Man ===" << std::endl;
-    std::cout << "Done" << std::endl;
 }
 
-static void run_go()
+// ---- Router ----
+
+static void handleClient(tcp::socket socket)
 {
-    auto m = s_cache.load("go");
-    if (!m) { std::cerr << "go: load failed" << std::endl; return; }
-
-    auto app = m.create(R"({"action":"new_game","width":19,"height":19})");
-    if (!app) { std::cerr << "go: create failed" << std::endl; return; }
-
-    int blacks[] = { 3*19+3, 3*19+15, 15*19+3, 15*19+15 };
-    int whites[] = { 9*19+9, 9*19+8, 9*19+10, 8*19+9, 10*19+9 };
-
-    for (int i = 0; i < 4; ++i)
+    try
     {
-        if (m.app_is_done(app.get())) break;
-        boost::json::object tb; tb["action"] = "tick"; tb["value"] = blacks[i];
-        char* ob = m.app_process(app.get(), boost::json::serialize(tb).c_str());
-        if (ob) m.app_free_string(ob);
+        beast::tcp_stream stream(std::move(socket));
+        beast::flat_buffer buf;
+        http::request<http::string_body> req;
+        http::read(stream, buf, req);
 
-        if (m.app_is_done(app.get())) break;
-        boost::json::object tw; tw["action"] = "tick"; tw["value"] = whites[i];
-        char* ow = m.app_process(app.get(), boost::json::serialize(tw).c_str());
-        if (ow) m.app_free_string(ow);
-    }
+        websocket::stream<beast::tcp_stream> ws(std::move(stream));
+        ws.accept(req);
 
-    if (!m.app_is_done(app.get()))
-    {
-        boost::json::object tw; tw["action"] = "tick"; tw["value"] = whites[4];
-        char* ow = m.app_process(app.get(), boost::json::serialize(tw).c_str());
-        if (ow) m.app_free_string(ow);
+        // Read the first message to determine which app to load
+        buf.clear();
+        ws.read(buf);
+        std::string first_msg = beast::buffers_to_string(buf.data());
 
-        // Pass
-        for (int i = 0; i < 2; ++i)
-        {
-            boost::json::object tp; tp["action"] = "tick"; tp["value"] = -1;
-            char* op = m.app_process(app.get(), boost::json::serialize(tp).c_str());
-            if (op) m.app_free_string(op);
+        // Determine app name from the message
+        std::string app_name;
+        try {
+            auto val = boost::json::parse(first_msg);
+            if (!val.is_object()) { ws.write(asio::buffer("[]")); return; }
+            auto& obj = val.as_object();
+
+            auto it = obj.find("app");
+            if (it != obj.end() && it->value().is_string()) {
+                app_name = std::string(it->value().as_string());
+            } else if ((it = obj.find("text")) != obj.end() && it->value().is_string()) {
+                app_name = "chat";
+            } else if ((it = obj.find("game")) != obj.end() && it->value().is_string()) {
+                app_name = std::string(it->value().as_string());
+            } else {
+                app_name = "snake";
+            }
+        } catch (...) {
+            ws.write(asio::buffer("[]"));
+            return;
         }
+
+        // Load the app module and create instance
+        static AppModuleCache cache;
+        AppModule mod = cache.load(app_name);
+        if (!mod)
+        {
+            boost::json::object err;
+            err["type"] = "error";
+            err["msg"]  = "failed to load " + app_name;
+            ws.write(asio::buffer(boost::json::serialize(err)));
+            return;
+        }
+
+        AppPtr app = mod.create(first_msg);
+        if (!app)
+        {
+            boost::json::object err;
+            err["type"] = "error";
+            err["msg"]  = "failed to create " + app_name + " instance";
+            ws.write(asio::buffer(boost::json::serialize(err)));
+            return;
+        }
+
+        handleApp(ws, first_msg, mod, app.get());
     }
-
-    std::cout << "=== Go ===" << std::endl;
-    std::cout << "Done" << std::endl;
+    catch (const boost::system::system_error&)
+    {
+    }
 }
 
-static void run_chat()
-{
-    auto m = s_cache.load("chat");
-    if (!m) { std::cerr << "chat: load failed" << std::endl; return; }
-
-    auto app = m.create("{\"text\":\"hello\"}");
-    if (!app) { std::cerr << "chat: create failed" << std::endl; return; }
-
-    char* r1 = m.app_process(app.get(), "{\"text\":\"Hello\"}");
-    char* r2 = m.app_process(app.get(), "{\"text\":\"\\u4f60\\u597d\\u4e16\\u754c\"}");
-
-    std::cout << "=== Chat ===" << std::endl;
-    if (r1) std::cout << "Hello -> " << r1 << std::endl;
-    if (r2) std::cout << "\\u4f60\\u597d\\u4e16\\u754c -> " << r2 << std::endl;
-    if (r1) m.app_free_string(r1);
-    if (r2) m.app_free_string(r2);
-}
-
-static void run_netconn()
-{
-    std::cout << "=== NetConn (Core) ===" << std::endl;
-    run_netconn_demo();
-}
+// ---- Main ----
 
 int main()
 {
-    run_netconn();
-    run_chat();
-    run_pacman();
-    run_gomoku();
-    run_snake();
-    run_go();
-    return 0;
+    try
+    {
+        asio::io_context io;
+        tcp::acceptor acceptor(io, tcp::endpoint(tcp::v4(), 3001));
+        std::cout << "Game server listening on port 3001" << std::endl;
+
+        while (true)
+        {
+            tcp::socket socket(io);
+            acceptor.accept(socket);
+            std::thread(handleClient, std::move(socket)).detach();
+        }
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << e.what() << std::endl;
+        return 1;
+    }
 }

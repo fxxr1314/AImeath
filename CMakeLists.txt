@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.12)
-project(demo LANGUAGES CXX)
+project(gameserver LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,12 +12,18 @@ foreach(dir ${APP_DIRS})
     add_subdirectory(${dir}/backend)
   endif()
 endforeach()
-add_subdirectory(backend)
 
-add_executable(demo main.cpp)
-target_link_libraries(demo app core dl)
-add_dependencies(demo snake gomoku pacman go)
+find_package(Threads REQUIRED)
 
-set_target_properties(demo PROPERTIES
+add_executable(gameserver main.cpp)
+target_link_libraries(gameserver app core Threads::Threads dl)
+add_dependencies(gameserver snake gomoku pacman go)
+
+set_target_properties(gameserver PROPERTIES
     BUILD_RPATH "${CMAKE_BINARY_DIR}/output/lib"
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output
+)
+
+target_include_directories(gameserver PRIVATE
+    ${CMAKE_SOURCE_DIR}/module/app/include
 )

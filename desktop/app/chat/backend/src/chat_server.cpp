@@ -7,6 +7,10 @@
 #include <fstream>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <utility>
 
 #include <boost/json.hpp>
 
@@ -17,10 +21,14 @@
 struct ChatApp
 {
     std::vector<boost::json::object> history;
+    std::vector<boost::json::object> pending_outputs;
+    std::mutex mtx;
+    std::atomic<bool> cancelled{false};
+    std::thread stream_thread;
     bool done = false;
 };
 
-// ---- DeepSeek streaming (accumulates into a JSON array) ----
+// ---- DeepSeek streaming (now uses callback) ----
 
 static std::string loadDeepSeekApiKey()
 {
@@ -45,15 +53,17 @@ static std::string loadDeepSeekApiKey()
     return "";
 }
 
-/// Call DeepSeek and return a JSON array of output messages
-/// (stream_start, delta..., stream_end)
-static boost::json::array callDeepSeek(
-    const std::vector<boost::json::object>& history)
+using PushEvent = std::function<void(boost::json::object)>;
+
+/// Call DeepSeek, pushing reasoning/delta/stream_end events via callback.
+static void callDeepSeek(
+    const std::vector<boost::json::object>& history,
+    PushEvent push_event,
+    std::string& out_full_response,
+    std::string& out_full_reasoning)
 {
-    boost::json::array outputs;
-    boost::json::object start;
-    start["type"] = "stream_start";
-    outputs.push_back(start);
+    out_full_response.clear();
+    out_full_reasoning.clear();
 
     boost::json::array msgs;
     for (const auto& m : history) msgs.push_back(m);
@@ -62,7 +72,7 @@ static boost::json::array callDeepSeek(
     body["model"] = "deepseek-v4-flash";
     body["messages"] = msgs;
     body["stream"] = true;
-    body["thinking"] = {{"type", "disabled"}};
+    body["thinking"] = {{"type", "enabled"}, {"budget_tokens", 4096}};
 
     std::string apiKey = loadDeepSeekApiKey();
     if (apiKey.empty())
@@ -70,11 +80,10 @@ static boost::json::array callDeepSeek(
         boost::json::object end;
         end["type"] = "stream_end";
         end["msg"]  = "missing deepseek_api_key in config.json";
-        outputs.push_back(end);
-        return outputs;
+        push_event(std::move(end));
+        return;
     }
 
-    std::string full_response;
     std::string leftover;
 
     auto on_chunk = [&](const std::string& chunk)
@@ -99,11 +108,32 @@ static boost::json::array callDeepSeek(
                     auto& choices = val.as_object().at("choices").as_array();
                     if (choices.empty()) continue;
                     auto& delta = choices[0].as_object().at("delta").as_object();
-                    if (!delta.contains("content")) continue;
-                    std::string content = delta.at("content").as_string().c_str();
-                    full_response += content;
-                    boost::json::value push_val = {{"type", "delta"}, {"text", content}};
-                    outputs.push_back(push_val);
+
+                    if (delta.contains("reasoning_content") && delta.at("reasoning_content").is_string())
+                    {
+                        std::string reasoning = delta.at("reasoning_content").as_string().c_str();
+                        if (!reasoning.empty())
+                        {
+                            out_full_reasoning += reasoning;
+                            boost::json::object push_val;
+                            push_val["type"] = "reasoning";
+                            push_val["text"] = std::move(reasoning);
+                            push_event(std::move(push_val));
+                        }
+                    }
+
+                    if (delta.contains("content") && delta.at("content").is_string())
+                    {
+                        std::string content = delta.at("content").as_string().c_str();
+                        if (!content.empty())
+                        {
+                            out_full_response += content;
+                            boost::json::object push_val;
+                            push_val["type"] = "delta";
+                            push_val["text"] = std::move(content);
+                            push_event(std::move(push_val));
+                        }
+                    }
                 }
                 catch (const std::exception&) {}
             }
@@ -137,11 +167,32 @@ static boost::json::array callDeepSeek(
                     auto& choices = val.as_object().at("choices").as_array();
                     if (choices.empty()) continue;
                     auto& delta = choices[0].as_object().at("delta").as_object();
-                    if (!delta.contains("content")) continue;
-                    std::string content = delta.at("content").as_string().c_str();
-                    full_response += content;
-                    boost::json::value push_val = {{"type", "delta"}, {"text", content}};
-                    outputs.push_back(push_val);
+
+                    if (delta.contains("reasoning_content") && delta.at("reasoning_content").is_string())
+                    {
+                        std::string reasoning = delta.at("reasoning_content").as_string().c_str();
+                        if (!reasoning.empty())
+                        {
+                            out_full_reasoning += reasoning;
+                            boost::json::object push_val;
+                            push_val["type"] = "reasoning";
+                            push_val["text"] = std::move(reasoning);
+                            push_event(std::move(push_val));
+                        }
+                    }
+
+                    if (delta.contains("content") && delta.at("content").is_string())
+                    {
+                        std::string content = delta.at("content").as_string().c_str();
+                        if (!content.empty())
+                        {
+                            out_full_response += content;
+                            boost::json::object push_val;
+                            push_val["type"] = "delta";
+                            push_val["text"] = std::move(content);
+                            push_event(std::move(push_val));
+                        }
+                    }
                 }
                 catch (const std::exception&) {}
             }
@@ -155,16 +206,15 @@ static boost::json::array callDeepSeek(
         {
             boost::json::object end_val;
             end_val["type"] = "stream_end";
-            end_val["msg"] = what;
-            outputs.push_back(end_val);
-            return outputs;
+            end_val["msg"] = std::move(what);
+            push_event(std::move(end_val));
+            return;
         }
     }
 
     boost::json::object end;
     end["type"] = "stream_end";
-    outputs.push_back(end);
-    return outputs;
+    push_event(std::move(end));
 }
 
 // ---- Command handling (returns array of output messages) ----
@@ -230,6 +280,93 @@ static boost::json::array handleCommand(const std::string& text)
     return result;
 }
 
+// ---- Streaming helpers ----
+
+static boost::json::array drainPoll(ChatApp* app)
+{
+    std::lock_guard<std::mutex> lock(app->mtx);
+    boost::json::array arr;
+    for (auto& obj : app->pending_outputs)
+        arr.push_back(std::move(obj));
+    app->pending_outputs.clear();
+
+    if (!arr.empty())
+    {
+        auto& last = arr[arr.size() - 1];
+        if (last.is_object())
+        {
+            auto& obj = last.as_object();
+            auto it = obj.find("type");
+            if (it != obj.end() && it->value().is_string() &&
+                it->value().as_string() == "stream_end")
+            {
+                app->done = true;
+            }
+        }
+    }
+
+    return arr;
+}
+
+/// Handle a user text message (non-command): spawn background DeepSeek thread.
+static boost::json::array handleUserMessage(ChatApp* app, const std::string& text)
+{
+    boost::json::object user_msg;
+    user_msg["role"] = "user";
+    user_msg["content"] = text;
+
+    {
+        std::lock_guard<std::mutex> lock(app->mtx);
+        app->history.push_back(std::move(user_msg));
+    }
+
+    // Take a copy of history for the background thread
+    std::vector<boost::json::object> history_copy;
+    {
+        std::lock_guard<std::mutex> lock(app->mtx);
+        history_copy = app->history;
+    }
+
+    ChatApp* app_ptr = app;
+    std::thread t([app_ptr, history_copy]()
+    {
+        auto push_event = [app_ptr](boost::json::object obj)
+        {
+            std::lock_guard<std::mutex> lock(app_ptr->mtx);
+            if (app_ptr->cancelled) return;
+            app_ptr->pending_outputs.push_back(std::move(obj));
+        };
+
+        std::string full_response, full_reasoning;
+        callDeepSeek(history_copy, push_event, full_response, full_reasoning);
+
+        // Update history with assistant response (stream_end already pushed)
+        if (!full_response.empty())
+        {
+            std::lock_guard<std::mutex> lock(app_ptr->mtx);
+            if (app_ptr->cancelled) return;
+            boost::json::object assistant_msg;
+            assistant_msg["role"] = "assistant";
+            assistant_msg["content"] = std::move(full_response);
+            app_ptr->history.push_back(std::move(assistant_msg));
+        }
+    });
+
+    {
+        std::lock_guard<std::mutex> lock(app->mtx);
+        if (app->stream_thread.joinable())
+            app->stream_thread.detach();
+        app->stream_thread = std::move(t);
+    }
+
+    // Return stream_start immediately so client begins polling
+    boost::json::array result;
+    boost::json::object start;
+    start["type"] = "stream_start";
+    result.push_back(std::move(start));
+    return result;
+}
+
 // ---- Unified App C ABI ----
 
 extern "C"
@@ -243,7 +380,14 @@ void* app_create(const char* config_json)
 
 void app_destroy(void* p)
 {
-    delete static_cast<ChatApp*>(p);
+    auto* app = static_cast<ChatApp*>(p);
+    {
+        std::lock_guard<std::mutex> lock(app->mtx);
+        app->cancelled = true;
+    }
+    if (app->stream_thread.joinable())
+        app->stream_thread.detach();
+    delete app;
 }
 
 char* app_process(void* p, const char* input_json)
@@ -253,54 +397,40 @@ char* app_process(void* p, const char* input_json)
     boost::json::array outputs;
     std::string msg(input_json);
 
-    std::string text;
-    try {
-        auto val = boost::json::parse(msg);
-        if (val.is_object()) {
-            auto& obj = val.as_object();
-            auto it = obj.find("text");
-            if (it != obj.end() && it->value().is_string())
-                text = std::string(it->value().as_string());
-        }
-    } catch (...) {}
-
-    if (!text.empty())
+    try
     {
-        if (text[0] == '/')
+        auto val = boost::json::parse(msg);
+        if (!val.is_object()) goto done;
+
+        auto& obj = val.as_object();
+
+        // Poll action: drain pending events
+        auto action_it = obj.find("action");
+        if (action_it != obj.end() && action_it->value().is_string() &&
+            action_it->value().as_string() == "poll")
         {
-            outputs = handleCommand(text);
+            outputs = drainPoll(app);
+            goto done;
         }
-        else
+
+        // Text message
+        auto text_it = obj.find("text");
+        if (text_it != obj.end() && text_it->value().is_string())
         {
-            boost::json::object user_msg;
-            user_msg["role"] = "user";
-            user_msg["content"] = text;
-            app->history.push_back(user_msg);
-
-            outputs = callDeepSeek(app->history);
-
-            // Build full response string from delta messages
-            std::string full;
-            for (auto& item : outputs)
+            std::string text(text_it->value().as_string());
+            if (text[0] == '/')
             {
-                if (item.is_object())
-                {
-                    auto& obj = item.as_object();
-                    auto it = obj.find("text");
-                    if (it != obj.end() && it->value().is_string())
-                        full += std::string(it->value().as_string());
-                }
+                outputs = handleCommand(text);
             }
-            if (!full.empty())
+            else
             {
-                boost::json::object assistant_msg;
-                assistant_msg["role"] = "assistant";
-                assistant_msg["content"] = full;
-                app->history.push_back(assistant_msg);
+                outputs = handleUserMessage(app, text);
             }
         }
     }
+    catch (...) {}
 
+done:
     std::string result = boost::json::serialize(outputs);
     char* buf = static_cast<char*>(std::malloc(result.size() + 1));
     if (buf) std::memcpy(buf, result.data(), result.size() + 1);
