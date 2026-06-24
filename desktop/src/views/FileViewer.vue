@@ -22,9 +22,17 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import { marked } from 'marked'
+import mermaid from 'mermaid'
+
+mermaid.initialize({
+  startOnLoad: false,
+  theme: 'dark',
+  fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+  securityLevel: 'loose',
+})
 
 const route = useRoute()
 
@@ -58,6 +66,26 @@ function openNewTab() {
   window.open(fileUrl.value, '_blank')
 }
 
+async function renderMermaid() {
+  const container = document.querySelector('.fv-markdown')
+  if (!container) return
+  const blocks = container.querySelectorAll('pre > code.language-mermaid')
+  if (!blocks.length) return
+  blocks.forEach((el) => {
+    const pre = el.parentElement
+    if (!pre) return
+    pre.classList.add('mermaid')
+    pre.innerHTML = el.textContent || ''
+    el.remove()
+  })
+  try {
+    const nodes = Array.from(container.querySelectorAll('.mermaid'))
+    await mermaid.run({ nodes })
+  } catch (e) {
+    console.error('mermaid render error:', e)
+  }
+}
+
 onMounted(async () => {
   name.value = route.query.name || ''
   fileUrl.value = route.query.url || ''
@@ -79,6 +107,10 @@ onMounted(async () => {
     }
   }
   loading.value = false
+  if (kind.value === 'markdown') {
+    await nextTick()
+    await renderMermaid()
+  }
 })
 </script>
 

@@ -145,3 +145,11 @@ npm run dev                    # 启动 Vite 开发服务器
 - **聊天服务器**：WebSocket 接收用户消息 → 调用 DeepSeek API → 流式 `stream_start`/`delta`/`stream_end` 协议推回前端；支持 `/图片`、`/视频`、`/音乐`、`/游戏xxx` 指令
 - **前端**：Vue 3 + vue-router（hash 模式）桌面环境，Composition API + `<script setup>`，WebSocket 直连服务器（无 Vite 代理），Win11 窗口系统（拖动/缩放/最小化/最大化/关闭），Markdown 渲染（marked），CSS Grid 渲染游戏网格，游戏配置集中至 `src/config/games.js`，路由自动生成
 - **WSL 兼容**：`vite.config.js` 设 `host: '0.0.0.0'` 及 `cacheDir: 'node_modules/.vite'` 规避 UNC 路径问题
+```mermaid
+graph LR
+A[方形] -->B(圆角)
+    B --> C{条件a}
+    C -->|a=1| D[结果1]
+    C -->|a=2| E[结果2]
+    F[横向流程图]
+```
