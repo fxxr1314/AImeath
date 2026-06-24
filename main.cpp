@@ -8,14 +8,15 @@
  *   - 包含 "game"  字段 → 路由到对应游戏
  *   - 其它            → 路由到 snake
  *
- * 每个连接在独立线程中运行，通过 C ABI（app_create / app_process
- * / app_is_done）与 app 通信。
+ * 每个连接由 ThreadPool 调度执行，通过 C ABI (app_create /
+ * app_process / app_is_done) 与 app 通信。
  */
 
 #include <iostream>
 #include <string>
 #include <thread>
 #include <memory>
+#include <csignal>
 
 #include <boost/asio.hpp>
 #include <boost/beast/core.hpp>
@@ -24,6 +25,9 @@
 #include <boost/json.hpp>
 
 #include "app_mod.hpp"
+#include "threadmgr.hpp"
+#include "logger.hpp"
+#include "wsutil.hpp"
 
 namespace asio  = boost::asio;
 namespace beast = boost::beast;
@@ -31,12 +35,24 @@ namespace http  = beast::http;
 namespace websocket = beast::websocket;
 using tcp = asio::ip::tcp;
 
+// ---- 常量 ----
+
+constexpr int PORT = 3001;
+constexpr int THREAD_COUNT = 4;
+
+namespace key {
+    constexpr auto APP  = "app";
+    constexpr auto TEXT = "text";
+    constexpr auto GAME = "game";
+}
+
+namespace appname {
+    constexpr auto CHAT  = "chat";
+    constexpr auto SNAKE = "snake";
+}
+
 // ============================================================
 //  App 消息循环
-//  - 处理首条消息后进入轮询循环
-//  - 从 WebSocket 读取客户端消息，交给 app_process 处理
-//  - app_process 返回 JSON 数组，逐条发送回客户端
-//  - 当 app_is_done() 返回 true 时退出循环，关闭连接
 // ============================================================
 
 static void handleApp(websocket::stream<beast::tcp_stream>& ws,
@@ -45,10 +61,8 @@ static void handleApp(websocket::stream<beast::tcp_stream>& ws,
 {
     // 处理首条消息（创建 app 时传入的 config / 命令）
     char* out = mod.app_process(app, first_msg.c_str());
-    if (out)
-    {
+    if (out) {
         try {
-            // 返回值为 JSON 数组，逐元素分帧发送
             auto arr = boost::json::parse(out).as_array();
             for (auto& item : arr)
                 ws.write(asio::buffer(boost::json::serialize(item)));
@@ -56,17 +70,14 @@ static void handleApp(websocket::stream<beast::tcp_stream>& ws,
         mod.app_free_string(out);
     }
 
-    // 循环处理后续消息（包括聊天轮询、终端输入、游戏操作等）
+    // 循环处理后续消息
     beast::flat_buffer buf;
-    while (!mod.app_is_done(app))
-    {
+    while (!mod.app_is_done(app)) {
         buf.clear();
         ws.read(buf);
         std::string msg = beast::buffers_to_string(buf.data());
-
         out = mod.app_process(app, msg.c_str());
-        if (out)
-        {
+        if (out) {
             try {
                 auto arr = boost::json::parse(out).as_array();
                 for (auto& item : arr)
@@ -78,17 +89,12 @@ static void handleApp(websocket::stream<beast::tcp_stream>& ws,
 }
 
 // ============================================================
-//  客户端连接处理（路由 + 生命周期）
-//  1. HTTP Upgrade → WebSocket
-//  2. 读取首条 JSON 消息，路由到对应 app
-//  3. 加载 .so → 创建 app 实例 → 进入消息循环
+//  客户端连接处理
 // ============================================================
 
-static void handleClient(tcp::socket socket)
+static void handleClient(tcp::socket socket, Logger& logger)
 {
-    try
-    {
-        // --- HTTP Upgrade 到 WebSocket ---
+    try {
         beast::tcp_stream stream(std::move(socket));
         beast::flat_buffer buf;
         http::request<http::string_body> req;
@@ -97,92 +103,110 @@ static void handleClient(tcp::socket socket)
         websocket::stream<beast::tcp_stream> ws(std::move(stream));
         ws.accept(req);
 
-        // --- 读取首条消息，用于路由 ---
+        // 读取首条消息用于路由
         buf.clear();
         ws.read(buf);
         std::string first_msg = beast::buffers_to_string(buf.data());
 
-        // --- 根据 JSON 字段选择 app ---
+        // 根据 JSON 字段路由到对应 app
         std::string app_name;
-        try {
+        {
             auto val = boost::json::parse(first_msg);
-            if (!val.is_object()) { ws.write(asio::buffer("[]")); return; }
-            auto& obj = val.as_object();
-
-            auto it = obj.find("app");
-            if (it != obj.end() && it->value().is_string()) {
-                // {"app":"terminal"} → 显式指定
-                app_name = std::string(it->value().as_string());
-            } else if ((it = obj.find("text")) != obj.end() && it->value().is_string()) {
-                // {"text":"你好"} → 聊天
-                app_name = "chat";
-            } else if ((it = obj.find("game")) != obj.end() && it->value().is_string()) {
-                // {"game":"snake"} → 游戏
-                app_name = std::string(it->value().as_string());
-            } else {
-                // 默认 snake
-                app_name = "snake";
+            if (!val.is_object()) {
+                ws.write(asio::buffer(jsonError("invalid first message")));
+                return;
             }
-        } catch (...) {
-            ws.write(asio::buffer("[]"));
-            return;
+
+            std::string text = jsonParseStr(val, key::APP);
+            if (!text.empty()) {
+                app_name = std::move(text);
+            } else {
+                text = jsonParseStr(val, key::TEXT);
+                if (!text.empty()) {
+                    app_name = appname::CHAT;
+                } else {
+                    text = jsonParseStr(val, key::GAME);
+                    if (!text.empty())
+                        app_name = std::move(text);
+                    else
+                        app_name = appname::SNAKE;
+                }
+            }
         }
 
-        // --- 加载 app 动态库（带缓存，只加载一次） ---
+        logger.info() << "Routing to app: " << app_name;
+
+        // 加载 app 动态库（带缓存）
         static AppModuleCache cache;
         AppModule mod = cache.load(app_name);
-        if (!mod)
-        {
-            boost::json::object err;
-            err["type"] = "error";
-            err["msg"]  = "failed to load " + app_name;
-            ws.write(asio::buffer(boost::json::serialize(err)));
+        if (!mod) {
+            ws.write(asio::buffer(jsonError("failed to load " + app_name)));
             return;
         }
 
-        // --- 创建 app 实例，传入首条消息作为配置 ---
         AppPtr app = mod.create(first_msg);
-        if (!app)
-        {
-            boost::json::object err;
-            err["type"] = "error";
-            err["msg"]  = "failed to create " + app_name + " instance";
-            ws.write(asio::buffer(boost::json::serialize(err)));
+        if (!app) {
+            ws.write(asio::buffer(jsonError("failed to create " + app_name + " instance")));
             return;
         }
 
-        // --- 进入消息循环 ---
         handleApp(ws, first_msg, mod, app.get());
     }
-    catch (const boost::system::system_error&)
-    {
-        // 连接异常断开（客户端关闭、网络中断等），静默处理
+    catch (const boost::system::system_error&) {
+        // 连接异常断开，静默处理
     }
 }
 
 // ============================================================
-//  主函数 — 监听端口，每个连接启新线程
+//  主函数
 // ============================================================
 
 int main()
 {
-    try
-    {
-        asio::io_context io;
-        tcp::acceptor acceptor(io, tcp::endpoint(tcp::v4(), 3001));
-        std::cout << "Game server listening on port 3001" << std::endl;
+    Logger logger(std::cout, Logger::INFO);
 
-        while (true)
-        {
-            tcp::socket socket(io);
-            acceptor.accept(socket);
-            // 每个客户端连接在新线程中运行，立即 detach 不等待结束
-            std::thread(handleClient, std::move(socket)).detach();
+    // 有界的线程池，替代无限制的 std::thread().detach()
+    ThreadPool pool(THREAD_COUNT);
+    auto& io = pool.io_context();
+
+    tcp::acceptor acceptor(io, tcp::endpoint(tcp::v4(), PORT));
+
+    // 独立的 io_context 处理信号，避免死锁
+    asio::io_context sig_io;
+    asio::signal_set signals(sig_io, SIGINT, SIGTERM);
+    signals.async_wait([&acceptor, &logger](auto ec, auto sig) {
+        if (!ec) {
+            logger.info() << "Signal " << sig << " received, shutting down...";
+            acceptor.close();  // 解除主线程 accept 阻塞
         }
+    });
+    std::thread sig_thread([&sig_io] { sig_io.run(); });
+
+    logger.info() << "Game server listening on port " << PORT;
+
+    // 主线程阻塞在 accept，信号到来时 acceptor.close() 使 accept 抛异常退出
+    while (true) {
+        beast::error_code ec;
+        tcp::socket socket(io);
+        acceptor.accept(socket, ec);
+        if (ec) {
+            if (ec == asio::error::operation_aborted) break;
+            logger.error() << "Accept error: " << ec.message();
+            break;
+        }
+        auto sock = std::make_shared<tcp::socket>(std::move(socket));
+        pool.submit([sock, &logger]() {
+            handleClient(std::move(*sock), logger);
+        });
     }
-    catch (const std::exception& e)
-    {
-        std::cerr << e.what() << std::endl;
-        return 1;
-    }
+
+    sig_io.stop();
+    sig_thread.join();
+
+    logger.info() << "Waiting for active connections...";
+    pool.wait_all();
+    pool.shutdown();
+
+    logger.info() << "Server stopped.";
+    return 0;
 }
