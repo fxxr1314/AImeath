@@ -63,11 +63,11 @@ AppModule AppModuleCache::load(const std::string& name)
 
     try
     {
-        m.app_create     = m.lib.get<void*(const char*)>("app_create");
-        m.app_destroy    = m.lib.get<void(void*)>("app_destroy");
-        m.app_process    = m.lib.get<char*(void*,const char*)>("app_process");
+        m.app_create      = m.lib.get<void*(const char*)>("app_create");
+        m.app_destroy     = m.lib.get<void(void*)>("app_destroy");
+        m.app_process     = m.lib.get<char*(void*,const char*)>("app_process");
         m.app_free_string = m.lib.get<void(char*)>("app_free_string");
-        m.app_is_done    = m.lib.get<int(void*)>("app_is_done");
+        m.app_is_done     = m.lib.get<int(void*)>("app_is_done");
     }
     catch (const boost::system::system_error& e)
     {
@@ -77,8 +77,16 @@ AppModule AppModuleCache::load(const std::string& name)
 
     if (!m.app_create || !m.app_destroy || !m.app_process || !m.app_free_string || !m.app_is_done)
     {
-        std::cerr << "symbols not found in lib" << name << ".so" << std::endl;
+        std::cerr << "required symbols not found in lib" << name << ".so" << std::endl;
         return {};
+    }
+
+    // Optional async symbols — NULL if app doesn't support them yet
+    try {
+        m.app_on_input   = m.lib.get<void(void*,const char*)>("app_on_input");
+        m.app_set_output = m.lib.get<void(void*,app_output_fn,void*)>("app_set_output");
+    } catch (...) {
+        // async API not available, will fall back to app_process
     }
 
     m_cache[name] = m;
