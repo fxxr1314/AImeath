@@ -66,6 +66,37 @@ function openNewTab() {
   window.open(fileUrl.value, '_blank')
 }
 
+function wrapMermaid(el) {
+  const source = el.getAttribute('data-source') || ''
+  const wrapper = document.createElement('div')
+  wrapper.className = 'mermaid-wrapper'
+  el.before(wrapper)
+  wrapper.appendChild(el)
+  const src = document.createElement('pre')
+  src.className = 'mermaid-source'
+  src.textContent = source
+  wrapper.appendChild(src)
+  const btn = document.createElement('button')
+  btn.className = 'mermaid-toggle'
+  btn.textContent = '◇'
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation()
+    wrapper.classList.toggle('show-source')
+  })
+  wrapper.appendChild(btn)
+  const svg = el.querySelector('svg')
+  if (svg) {
+    svg.style.cursor = 'pointer'
+    svg.addEventListener('click', (e) => {
+      e.stopPropagation()
+      const blob = new Blob([svg.outerHTML], { type: 'image/svg+xml' })
+      const url = URL.createObjectURL(blob)
+      window.open(url, '_blank')
+      setTimeout(() => URL.revokeObjectURL(url), 10000)
+    })
+  }
+}
+
 async function renderMermaid() {
   const container = document.querySelector('.fv-markdown')
   if (!container) return
@@ -75,12 +106,14 @@ async function renderMermaid() {
     const pre = el.parentElement
     if (!pre) return
     pre.classList.add('mermaid')
+    pre.setAttribute('data-source', el.textContent || '')
     pre.innerHTML = el.textContent || ''
     el.remove()
   })
   try {
     const nodes = Array.from(container.querySelectorAll('.mermaid'))
     await mermaid.run({ nodes })
+    nodes.forEach(wrapMermaid)
   } catch (e) {
     console.error('mermaid render error:', e)
   }
@@ -249,5 +282,44 @@ iframe.fv-pdf {
 .fv-link {
   color: #89b4fa;
   text-decoration: underline;
+}
+.fv-markdown :deep(.mermaid-wrapper) {
+  position: relative;
+}
+.fv-markdown :deep(.mermaid-toggle) {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  z-index: 1;
+  background: rgba(255,255,255,0.12);
+  border: 1px solid rgba(255,255,255,0.2);
+  color: #cdd6f4;
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1.4;
+  opacity: 0.5;
+  transition: opacity 0.2s;
+}
+.fv-markdown :deep(.mermaid-wrapper:hover .mermaid-toggle) {
+  opacity: 1;
+}
+.fv-markdown :deep(.mermaid-source) {
+  display: none;
+  margin: 0;
+  padding: 12px 16px;
+  background: #181825;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-x: auto;
+  white-space: pre;
+}
+.fv-markdown :deep(.mermaid-wrapper.show-source .mermaid-source) {
+  display: block;
+}
+.fv-markdown :deep(.mermaid-wrapper.show-source .mermaid > svg) {
+  display: none;
 }
 </style>

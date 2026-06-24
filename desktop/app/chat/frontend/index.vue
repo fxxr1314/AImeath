@@ -1,7 +1,6 @@
 <template>
   <div class="chat-page">
     <header class="chat-header">
-      <a class="chat-back" href="#/" target="_self">← 返回</a>
       <h1>Chat 喵</h1>
       <span class="chat-status" :class="statusClass">{{ statusText }}</span>
     </header>
@@ -52,9 +51,17 @@
 </template>
 
 <script setup>
-import { ref, computed, nextTick, onBeforeUnmount } from 'vue'
+import { ref, computed, nextTick, onBeforeUnmount, onMounted } from 'vue'
 import { marked } from 'marked'
+import mermaid from 'mermaid'
 import { createChannel } from '../../../src/services/channel.js'
+
+mermaid.initialize({
+  startOnLoad: false,
+  theme: 'default',
+  fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+  securityLevel: 'loose',
+})
 
 const WS_URL = `ws://${location.hostname}:3001/chat`
 
@@ -99,10 +106,61 @@ ch.onMessage((data) => {
   }
 })
 
+function wrapMermaid(el) {
+  const source = el.getAttribute('data-source') || ''
+  const wrapper = document.createElement('div')
+  wrapper.className = 'mermaid-wrapper'
+  el.before(wrapper)
+  wrapper.appendChild(el)
+  const src = document.createElement('pre')
+  src.className = 'mermaid-source'
+  src.textContent = source
+  wrapper.appendChild(src)
+  const btn = document.createElement('button')
+  btn.className = 'mermaid-toggle'
+  btn.textContent = '◇'
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation()
+    wrapper.classList.toggle('show-source')
+  })
+  wrapper.appendChild(btn)
+  const svg = el.querySelector('svg')
+  if (svg) {
+    svg.style.cursor = 'pointer'
+    svg.addEventListener('click', (e) => {
+      e.stopPropagation()
+      const blob = new Blob([svg.outerHTML], { type: 'image/svg+xml' })
+      const url = URL.createObjectURL(blob)
+      window.open(url, '_blank')
+      setTimeout(() => URL.revokeObjectURL(url), 10000)
+    })
+  }
+}
+
+function renderMermaidInChat() {
+  const blocks = document.querySelectorAll('.bubble pre > code.language-mermaid')
+  if (!blocks.length) return
+  blocks.forEach((el) => {
+    const pre = el.parentElement
+    if (!pre) return
+    pre.classList.add('mermaid')
+    pre.setAttribute('data-source', el.textContent || '')
+    pre.innerHTML = el.textContent || ''
+    el.remove()
+  })
+  const nodes = Array.from(document.querySelectorAll('.bubble .mermaid'))
+  if (nodes.length) {
+    mermaid.run({ nodes }).then(() => {
+      nodes.forEach(wrapMermaid)
+    }).catch((e) => console.error('mermaid chat error:', e))
+  }
+}
+
 function scrollBottom() {
   nextTick(() => {
     const el = msgBox.value
     if (el) el.scrollTop = el.scrollHeight
+    renderMermaidInChat()
   })
 }
 
@@ -124,6 +182,7 @@ function send() {
   scrollBottom()
 }
 
+onMounted(() => { renderMermaidInChat() })
 onBeforeUnmount(() => ch.close())
 </script>
 
@@ -132,8 +191,6 @@ onBeforeUnmount(() => ch.close())
   display: flex;
   flex-direction: column;
   height: 100vh;
-  max-width: 600px;
-  margin: 0 auto;
   background: #f5f7fb;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans SC', sans-serif;
 }
@@ -146,17 +203,6 @@ onBeforeUnmount(() => ch.close())
   background: #fff;
   border-bottom: 1px solid #e5e7eb;
   flex-shrink: 0;
-}
-
-.chat-back {
-  color: #2563eb;
-  text-decoration: none;
-  font-size: 14px;
-  flex-shrink: 0;
-}
-
-.chat-back:hover {
-  text-decoration: underline;
 }
 
 .chat-header h1 {
@@ -433,5 +479,44 @@ onBeforeUnmount(() => ch.close())
   max-width: 100%;
   border-radius: 8px;
   margin: 4px 0;
+}
+.bubble :deep(.mermaid-wrapper) {
+  position: relative;
+}
+.bubble :deep(.mermaid-toggle) {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  z-index: 1;
+  background: rgba(0,0,0,0.35);
+  border: none;
+  color: #fff;
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1.4;
+  opacity: 0.5;
+  transition: opacity 0.2s;
+}
+.bubble :deep(.mermaid-wrapper:hover .mermaid-toggle) {
+  opacity: 1;
+}
+.bubble :deep(.mermaid-source) {
+  display: none;
+  margin: 0;
+  padding: 10px 14px;
+  background: rgba(0,0,0,0.07);
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-x: auto;
+  white-space: pre;
+}
+.bubble :deep(.mermaid-wrapper.show-source .mermaid-source) {
+  display: block;
+}
+.bubble :deep(.mermaid-wrapper.show-source .mermaid > svg) {
+  display: none;
 }
 </style>
