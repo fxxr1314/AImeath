@@ -98,8 +98,9 @@ struct ChatApp::AsyncDeepSeek
     void cancel()
     {
         cancelled_ = true;
+        resolver_.cancel();
         beast::error_code ec;
-        if (stream_) beast::get_lowest_layer(*stream_).socket().close(ec);
+        stream_->lowest_layer().cancel(ec);
     }
 
 private:
@@ -271,6 +272,7 @@ private:
 
     void finish_success()
     {
+        if (cancelled_) return;
         boost::json::object end;
         end["type"] = "stream_end";
         push_(std::move(end));
@@ -279,6 +281,7 @@ private:
 
     void finish_error(const std::string& msg)
     {
+        if (cancelled_) return;
         boost::json::object end;
         end["type"] = "stream_end";
         if (!msg.empty()) end["msg"] = msg;
@@ -553,14 +556,15 @@ static void handleUserMessageAsync(ChatApp* app, const std::string& text)
         return;
     }
 
-    // Pick io_context: use provided one, or fall back to legacy thread
     asio::io_context* io = static_cast<asio::io_context*>(app->io_ctx_ptr);
     if (!io) {
-        // Fallback: spawn legacy background thread
+        // Fallback: legacy background thread
         ChatApp* app_ptr = app;
         std::thread t([app_ptr, history_copy]() {
             auto push_event = [app_ptr](boost::json::object obj) {
-                app_ptr->push_output(std::move(obj));
+                std::lock_guard<std::mutex> lock(app_ptr->mtx);
+                if (app_ptr->cancelled) return;
+                app_ptr->pending_outputs.push_back(std::move(obj));
             };
             std::string fr, fg;
             callDeepSeekLegacy(history_copy, push_event, fr, fg);
@@ -579,18 +583,20 @@ static void handleUserMessageAsync(ChatApp* app, const std::string& text)
             app->stream_thread = std::move(t);
         }
     } else {
-        // Async HTTP on io_context (zero extra threads)
-        auto stream = std::make_shared<ChatApp::AsyncDeepSeek>(*io);
-        ChatApp* app_ptr = app;
+        // Async HTTP on io_context — capture callback directly (no ChatApp ptr)
+        auto app_cb = app->output_cb;
+        auto app_ud = app->output_udata;
 
-        auto push_event = [app_ptr](boost::json::object obj) {
-            app_ptr->push_output(std::move(obj));
+        auto push_event = [app_cb, app_ud](boost::json::object obj) {
+            if (!app_cb) return;
+            std::string s = boost::json::serialize(obj);
+            app_cb(app_ud, s.c_str());
         };
 
-        auto on_done = [app_ptr](std::string response, std::string /*reasoning*/) {
+        auto on_done = [app_ptr = app](std::string response, std::string) {
+            std::lock_guard<std::mutex> lock(app_ptr->mtx);
+            if (app_ptr->cancelled) return;
             if (!response.empty()) {
-                std::lock_guard<std::mutex> lock(app_ptr->mtx);
-                if (app_ptr->cancelled) return;
                 boost::json::object am;
                 am["role"] = "assistant";
                 am["content"] = std::move(response);
@@ -599,6 +605,7 @@ static void handleUserMessageAsync(ChatApp* app, const std::string& text)
             app_ptr->current_stream.reset();
         };
 
+        auto stream = std::make_shared<ChatApp::AsyncDeepSeek>(*io);
         app->current_stream = stream;
         stream->start("api.deepseek.com", "443",
             boost::json::serialize(body), "Bearer " + apiKey,
