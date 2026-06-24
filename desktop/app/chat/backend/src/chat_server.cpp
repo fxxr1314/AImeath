@@ -11,28 +11,45 @@
 #include <atomic>
 #include <mutex>
 #include <utility>
+#include <memory>
 
+#include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
 #include <boost/json.hpp>
 
 #include "netconn.hpp"
+
+namespace asio  = boost::asio;
+namespace beast = boost::beast;
+namespace http  = beast::http;
+namespace ssl   = asio::ssl;
+using tcp = asio::ip::tcp;
 
 // ---- ChatApp state ----
 
 struct ChatApp
 {
     std::vector<boost::json::object> history;
-    std::vector<boost::json::object> pending_outputs; // legacy fallback
+    std::vector<boost::json::object> pending_outputs; // legacy
     std::mutex mtx;
     std::atomic<bool> cancelled{false};
-    std::thread stream_thread;
+    std::thread stream_thread;                        // legacy background thread
 
     // Async output
     app_output_fn output_cb = nullptr;
     void* output_udata = nullptr;
 
+    // Async I/O context (for async HTTP)
+    void* io_ctx_ptr = nullptr;
+
+    // Current async HTTP stream (shared_ptr, cancelled on destroy)
+    struct AsyncDeepSeek;
+    std::shared_ptr<AsyncDeepSeek> current_stream;
+
     bool done = false;
 
-    /// Push one output message via callback (async) or into pending (legacy).
     void push_output(boost::json::value val)
     {
         if (val.is_object()) {
@@ -42,7 +59,6 @@ struct ChatApp
                 it->value().as_string() == "stream_end")
                 done = true;
         }
-
         if (output_cb) {
             std::string s = boost::json::serialize(val);
             output_cb(output_udata, s.c_str());
@@ -53,160 +69,238 @@ struct ChatApp
     }
 };
 
-// ---- DeepSeek streaming ----
+// ---- Async HTTPS DeepSeek stream (zero threads) ----
+
+struct ChatApp::AsyncDeepSeek
+    : public std::enable_shared_from_this<ChatApp::AsyncDeepSeek>
+{
+    using PushFn = std::function<void(boost::json::object)>;
+    using DoneFn = std::function<void(std::string, std::string)>;
+
+    AsyncDeepSeek(asio::io_context& ioc)
+        : io_(ioc), resolver_(ioc)
+        , stream_(std::make_unique<ssl::stream<beast::tcp_stream>>(ioc, chat_ssl()))
+    {}
+
+    void start(const std::string& host, const std::string& port,
+               const std::string& body, const std::string& auth,
+               PushFn push, DoneFn done)
+    {
+        push_ = std::move(push);
+        done_ = std::move(done);
+        body_ = body;
+        auth_ = auth;
+        host_ = host;
+        port_ = port;
+        do_resolve();
+    }
+
+    void cancel()
+    {
+        cancelled_ = true;
+        beast::error_code ec;
+        if (stream_) beast::get_lowest_layer(*stream_).socket().close(ec);
+    }
+
+private:
+    static ssl::context& chat_ssl()
+    {
+        static ssl::context ctx(ssl::context::tlsv12_client);
+        return ctx;
+    }
+
+    asio::io_context& io_;
+    tcp::resolver resolver_;
+    std::unique_ptr<ssl::stream<beast::tcp_stream>> stream_;
+    beast::flat_buffer buf_;
+    http::response_parser<http::string_body> parser_;
+
+    std::atomic<bool> cancelled_{false};
+    size_t prev_body_size_ = 0;
+    std::string leftover_;
+
+    std::string host_, port_, body_, auth_;
+    std::string full_response_, full_reasoning_;
+    PushFn push_;
+    DoneFn done_;
+
+    void do_resolve()
+    {
+        auto self = shared_from_this();
+        resolver_.async_resolve(host_, port_,
+            [self](beast::error_code ec, tcp::resolver::results_type results) {
+                if (ec) { self->finish_error(ec.message()); return; }
+                self->do_connect(results);
+            });
+    }
+
+    void do_connect(tcp::resolver::results_type results)
+    {
+        auto self = shared_from_this();
+        beast::get_lowest_layer(*stream_).expires_after(std::chrono::seconds(30));
+        beast::get_lowest_layer(*stream_).async_connect(results,
+            [self](beast::error_code ec, auto) {
+                if (ec) { self->finish_error(ec.message()); return; }
+                self->do_handshake();
+            });
+    }
+
+    void do_handshake()
+    {
+        auto self = shared_from_this();
+        stream_->async_handshake(ssl::stream_base::client,
+            [self](beast::error_code ec) {
+                if (ec) { self->finish_error(ec.message()); return; }
+                self->do_write_request();
+            });
+    }
+
+    void do_write_request()
+    {
+        http::request<http::string_body> req(http::verb::post, "/chat/completions", 11);
+        req.set(http::field::host, host_);
+        req.set(http::field::content_type, "application/json");
+        req.set(http::field::connection, "close");
+        if (!auth_.empty()) req.set(http::field::authorization, auth_);
+        req.body() = body_;
+        req.prepare_payload();
+
+        auto self = shared_from_this();
+        http::async_write(*stream_, req,
+            [self](beast::error_code ec, std::size_t) {
+                if (ec) { self->finish_error(ec.message()); return; }
+                self->do_read_header();
+            });
+    }
+
+    void do_read_header()
+    {
+        auto self = shared_from_this();
+        http::async_read_header(*stream_, buf_, parser_,
+            [self](beast::error_code ec, std::size_t) {
+                if (ec) { self->finish_error(ec.message()); return; }
+                int status = self->parser_.get().result_int();
+                if (status != 200) {
+                    http::async_read(*self->stream_, self->buf_, self->parser_,
+                        [self](beast::error_code ec2, std::size_t) {
+                            std::string msg = "HTTP " + std::to_string(
+                                self->parser_.get().result_int());
+                            if (!ec2) msg += ": " + self->parser_.get().body();
+                            self->finish_error(msg);
+                        });
+                    return;
+                }
+                self->parser_.body_limit(std::numeric_limits<std::uint64_t>::max());
+                self->prev_body_size_ = 0;
+                self->do_read_body();
+            });
+    }
+
+    void do_read_body()
+    {
+        auto self = shared_from_this();
+        http::async_read_some(*stream_, buf_, parser_,
+            [self](beast::error_code ec, std::size_t) {
+                if (ec == http::error::end_of_stream) {
+                    self->drain_remaining();
+                    self->finish_success();
+                    return;
+                }
+                if (ec) { self->finish_error(ec.message()); return; }
+                self->drain_remaining();
+                if (!self->parser_.is_done()) self->do_read_body();
+            });
+    }
+
+    void drain_remaining()
+    {
+        auto& body = parser_.get().body();
+        size_t prev = prev_body_size_;
+        prev_body_size_ = body.size();
+        if (prev < body.size()) {
+            std::string chunk = body.substr(prev);
+            process_sse(chunk);
+        }
+    }
+
+    void process_sse(const std::string& chunk)
+    {
+        leftover_ += chunk;
+        size_t pos;
+        while ((pos = leftover_.find("\n\n")) != std::string::npos) {
+            std::string event = leftover_.substr(0, pos);
+            leftover_.erase(0, pos + 2);
+            std::istringstream ss(event);
+            std::string line;
+            while (std::getline(ss, line)) {
+                if (line.rfind("data: ", 0) != 0) continue;
+                std::string data = line.substr(6);
+                if (data == "[DONE]") continue;
+                try {
+                    auto val = boost::json::parse(data);
+                    auto& choices = val.as_object().at("choices").as_array();
+                    if (choices.empty()) continue;
+                    auto& delta = choices[0].as_object().at("delta").as_object();
+
+                    if (delta.contains("reasoning_content") &&
+                        delta.at("reasoning_content").is_string()) {
+                        std::string r = delta.at("reasoning_content").as_string().c_str();
+                        if (!r.empty()) {
+                            full_reasoning_ += r;
+                            boost::json::object o;
+                            o["type"] = "reasoning";
+                            o["text"] = std::move(r);
+                            push_(std::move(o));
+                        }
+                    }
+                    if (delta.contains("content") &&
+                        delta.at("content").is_string()) {
+                        std::string c = delta.at("content").as_string().c_str();
+                        if (!c.empty()) {
+                            full_response_ += c;
+                            boost::json::object o;
+                            o["type"] = "delta";
+                            o["text"] = std::move(c);
+                            push_(std::move(o));
+                        }
+                    }
+                } catch (...) {}
+            }
+        }
+    }
+
+    void finish_success()
+    {
+        boost::json::object end;
+        end["type"] = "stream_end";
+        push_(std::move(end));
+        if (done_) done_(std::move(full_response_), std::move(full_reasoning_));
+    }
+
+    void finish_error(const std::string& msg)
+    {
+        boost::json::object end;
+        end["type"] = "stream_end";
+        if (!msg.empty()) end["msg"] = msg;
+        push_(std::move(end));
+        if (done_) done_(std::move(full_response_), std::move(full_reasoning_));
+    }
+};
+
+// ---- API key ----
 
 static std::string loadDeepSeekApiKey()
 {
     std::ifstream f("config.json");
-    if (!f.is_open()) {
-        std::cerr << "WARNING: config.json not found" << std::endl;
-        return "";
-    }
+    if (!f.is_open()) return "";
     std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     try {
         auto val = boost::json::parse(content);
         auto& obj = val.as_object();
         if (obj.contains("deepseek_api_key"))
             return obj["deepseek_api_key"].as_string().c_str();
-    } catch (const std::exception& e) {
-        std::cerr << "WARNING: failed to parse config.json: " << e.what() << std::endl;
-    }
+    } catch (...) {}
     return "";
-}
-
-using PushEvent = std::function<void(boost::json::object)>;
-
-static void callDeepSeek(
-    const std::vector<boost::json::object>& history,
-    PushEvent push_event,
-    std::string& out_full_response,
-    std::string& out_full_reasoning)
-{
-    out_full_response.clear();
-    out_full_reasoning.clear();
-
-    boost::json::array msgs;
-    for (const auto& m : history) msgs.push_back(m);
-
-    boost::json::object body;
-    body["model"] = "deepseek-v4-flash";
-    body["messages"] = msgs;
-    body["stream"] = true;
-    body["thinking"] = {{"type", "enabled"}, {"budget_tokens", 4096}};
-
-    std::string apiKey = loadDeepSeekApiKey();
-    if (apiKey.empty()) {
-        boost::json::object end;
-        end["type"] = "stream_end";
-        end["msg"]  = "missing deepseek_api_key in config.json";
-        push_event(std::move(end));
-        return;
-    }
-
-    std::string leftover;
-
-    auto on_chunk = [&](const std::string& chunk) {
-        leftover += chunk;
-        size_t pos;
-        while ((pos = leftover.find("\n\n")) != std::string::npos) {
-            std::string event = leftover.substr(0, pos);
-            leftover.erase(0, pos + 2);
-            std::istringstream ss(event);
-            std::string line;
-            while (std::getline(ss, line)) {
-                if (line.rfind("data: ", 0) != 0) continue;
-                std::string data = line.substr(6);
-                if (data == "[DONE]") continue;
-                try {
-                    auto val = boost::json::parse(data);
-                    auto& choices = val.as_object().at("choices").as_array();
-                    if (choices.empty()) continue;
-                    auto& delta = choices[0].as_object().at("delta").as_object();
-
-                    if (delta.contains("reasoning_content") && delta.at("reasoning_content").is_string()) {
-                        std::string reasoning = delta.at("reasoning_content").as_string().c_str();
-                        if (!reasoning.empty()) {
-                            out_full_reasoning += reasoning;
-                            boost::json::object push_val;
-                            push_val["type"] = "reasoning";
-                            push_val["text"] = std::move(reasoning);
-                            push_event(std::move(push_val));
-                        }
-                    }
-                    if (delta.contains("content") && delta.at("content").is_string()) {
-                        std::string content = delta.at("content").as_string().c_str();
-                        if (!content.empty()) {
-                            out_full_response += content;
-                            boost::json::object push_val;
-                            push_val["type"] = "delta";
-                            push_val["text"] = std::move(content);
-                            push_event(std::move(push_val));
-                        }
-                    }
-                } catch (const std::exception&) {}
-            }
-        }
-    };
-
-    try {
-        httpsPostStream("api.deepseek.com", "443", "/chat/completions",
-            boost::json::serialize(body), "application/json",
-            "Bearer " + apiKey, on_chunk);
-        // Process remaining data
-        size_t pos;
-        while ((pos = leftover.find("\n\n")) != std::string::npos) {
-            std::string event = leftover.substr(0, pos);
-            leftover.erase(0, pos + 2);
-            std::istringstream ss(event);
-            std::string line;
-            while (std::getline(ss, line)) {
-                if (line.rfind("data: ", 0) != 0) continue;
-                std::string data = line.substr(6);
-                if (data == "[DONE]") continue;
-                try {
-                    auto val = boost::json::parse(data);
-                    auto& choices = val.as_object().at("choices").as_array();
-                    if (choices.empty()) continue;
-                    auto& delta = choices[0].as_object().at("delta").as_object();
-
-                    if (delta.contains("reasoning_content") && delta.at("reasoning_content").is_string()) {
-                        std::string reasoning = delta.at("reasoning_content").as_string().c_str();
-                        if (!reasoning.empty()) {
-                            out_full_reasoning += reasoning;
-                            boost::json::object push_val;
-                            push_val["type"] = "reasoning";
-                            push_val["text"] = std::move(reasoning);
-                            push_event(std::move(push_val));
-                        }
-                    }
-                    if (delta.contains("content") && delta.at("content").is_string()) {
-                        std::string content = delta.at("content").as_string().c_str();
-                        if (!content.empty()) {
-                            out_full_response += content;
-                            boost::json::object push_val;
-                            push_val["type"] = "delta";
-                            push_val["text"] = std::move(content);
-                            push_event(std::move(push_val));
-                        }
-                    }
-                } catch (const std::exception&) {}
-            }
-        }
-    } catch (const std::exception& e) {
-        std::string what = e.what();
-        if (what.find("eof") == std::string::npos &&
-            what.find("end of stream") == std::string::npos) {
-            boost::json::object end_val;
-            end_val["type"] = "stream_end";
-            end_val["msg"] = std::move(what);
-            push_event(std::move(end_val));
-            return;
-        }
-    }
-
-    boost::json::object end;
-    end["type"] = "stream_end";
-    push_event(std::move(end));
 }
 
 // ---- Command handling ----
@@ -259,9 +353,8 @@ static boost::json::array handleCommand(const std::string& text)
     return result;
 }
 
-// ---- Streaming helpers ----
+// ---- Legacy sync support ----
 
-/// Drain legacy pending_outputs (only used when output_cb is not set).
 static void drainAndPush(ChatApp* app)
 {
     std::lock_guard<std::mutex> lock(app->mtx);
@@ -270,7 +363,162 @@ static void drainAndPush(ChatApp* app)
     app->pending_outputs.clear();
 }
 
-/// Spawn background thread for DeepSeek, push stream_start immediately.
+static boost::json::array drainPollArray(ChatApp* app)
+{
+    std::lock_guard<std::mutex> lock(app->mtx);
+    boost::json::array arr;
+    for (auto& obj : app->pending_outputs)
+        arr.push_back(std::move(obj));
+    app->pending_outputs.clear();
+    if (!arr.empty()) {
+        auto& last = arr[arr.size() - 1];
+        if (last.is_object()) {
+            auto& obj = last.as_object();
+            auto it = obj.find("type");
+            if (it != obj.end() && it->value().is_string() &&
+                it->value().as_string() == "stream_end")
+                app->done = true;
+        }
+    }
+    return arr;
+}
+
+// ---- Legacy synchronous DeepSeek (for app_process fallback) ----
+
+using LegacyPush = std::function<void(boost::json::object)>;
+
+static void callDeepSeekLegacy(
+    const std::vector<boost::json::object>& history,
+    LegacyPush push_event,
+    std::string& out_full_response,
+    std::string& out_full_reasoning)
+{
+    out_full_response.clear();
+    out_full_reasoning.clear();
+
+    boost::json::array msgs;
+    for (const auto& m : history) msgs.push_back(m);
+
+    boost::json::object body;
+    body["model"] = "deepseek-v4-flash";
+    body["messages"] = msgs;
+    body["stream"] = true;
+    body["thinking"] = {{"type", "enabled"}, {"budget_tokens", 4096}};
+
+    std::string apiKey = loadDeepSeekApiKey();
+    if (apiKey.empty()) {
+        boost::json::object end;
+        end["type"] = "stream_end";
+        end["msg"]  = "missing deepseek_api_key in config.json";
+        push_event(std::move(end));
+        return;
+    }
+
+    std::string leftover;
+
+    auto on_chunk = [&](const std::string& chunk) {
+        leftover += chunk;
+        size_t pos;
+        while ((pos = leftover.find("\n\n")) != std::string::npos) {
+            std::string event = leftover.substr(0, pos);
+            leftover.erase(0, pos + 2);
+            std::istringstream ss(event);
+            std::string line;
+            while (std::getline(ss, line)) {
+                if (line.rfind("data: ", 0) != 0) continue;
+                std::string data = line.substr(6);
+                if (data == "[DONE]") continue;
+                try {
+                    auto val = boost::json::parse(data);
+                    auto& choices = val.as_object().at("choices").as_array();
+                    if (choices.empty()) continue;
+                    auto& delta = choices[0].as_object().at("delta").as_object();
+                    if (delta.contains("reasoning_content") && delta.at("reasoning_content").is_string()) {
+                        std::string r = delta.at("reasoning_content").as_string().c_str();
+                        if (!r.empty()) {
+                            out_full_reasoning += r;
+                            boost::json::object o;
+                            o["type"] = "reasoning";
+                            o["text"] = std::move(r);
+                            push_event(std::move(o));
+                        }
+                    }
+                    if (delta.contains("content") && delta.at("content").is_string()) {
+                        std::string c = delta.at("content").as_string().c_str();
+                        if (!c.empty()) {
+                            out_full_response += c;
+                            boost::json::object o;
+                            o["type"] = "delta";
+                            o["text"] = std::move(c);
+                            push_event(std::move(o));
+                        }
+                    }
+                } catch (...) {}
+            }
+        }
+    };
+
+    try {
+        httpsPostStream("api.deepseek.com", "443", "/chat/completions",
+            boost::json::serialize(body), "application/json",
+            "Bearer " + apiKey, on_chunk);
+        size_t pos;
+        while ((pos = leftover.find("\n\n")) != std::string::npos) {
+            std::string event = leftover.substr(0, pos);
+            leftover.erase(0, pos + 2);
+            std::istringstream ss(event);
+            std::string line;
+            while (std::getline(ss, line)) {
+                if (line.rfind("data: ", 0) != 0) continue;
+                std::string data = line.substr(6);
+                if (data == "[DONE]") continue;
+                try {
+                    auto val = boost::json::parse(data);
+                    auto& choices = val.as_object().at("choices").as_array();
+                    if (choices.empty()) continue;
+                    auto& delta = choices[0].as_object().at("delta").as_object();
+                    if (delta.contains("reasoning_content") && delta.at("reasoning_content").is_string()) {
+                        std::string r = delta.at("reasoning_content").as_string().c_str();
+                        if (!r.empty()) {
+                            out_full_reasoning += r;
+                            boost::json::object o;
+                            o["type"] = "reasoning";
+                            o["text"] = std::move(r);
+                            push_event(std::move(o));
+                        }
+                    }
+                    if (delta.contains("content") && delta.at("content").is_string()) {
+                        std::string c = delta.at("content").as_string().c_str();
+                        if (!c.empty()) {
+                            out_full_response += c;
+                            boost::json::object o;
+                            o["type"] = "delta";
+                            o["text"] = std::move(c);
+                            push_event(std::move(o));
+                        }
+                    }
+                } catch (...) {}
+            }
+        }
+    } catch (const std::exception& e) {
+        std::string what = e.what();
+        if (what.find("eof") == std::string::npos &&
+            what.find("end of stream") == std::string::npos) {
+            boost::json::object end_val;
+            end_val["type"] = "stream_end";
+            end_val["msg"] = std::move(what);
+            push_event(std::move(end_val));
+            return;
+        }
+    }
+
+    boost::json::object end;
+    end["type"] = "stream_end";
+    push_event(std::move(end));
+}
+
+// ---- Async path: zero-thread DeepSeek via io_context ----
+
 static void handleUserMessageAsync(ChatApp* app, const std::string& text)
 {
     boost::json::object user_msg;
@@ -287,60 +535,83 @@ static void handleUserMessageAsync(ChatApp* app, const std::string& text)
         history_copy = app->history;
     }
 
-    ChatApp* app_ptr = app;
-    std::thread t([app_ptr, history_copy]() {
+    boost::json::array msgs;
+    for (const auto& m : history_copy) msgs.push_back(m);
+
+    boost::json::object body;
+    body["model"] = "deepseek-v4-flash";
+    body["messages"] = msgs;
+    body["stream"] = true;
+    body["thinking"] = {{"type", "enabled"}, {"budget_tokens", 4096}};
+
+    std::string apiKey = loadDeepSeekApiKey();
+    if (apiKey.empty()) {
+        boost::json::object end;
+        end["type"] = "stream_end";
+        end["msg"]  = "missing deepseek_api_key in config.json";
+        app->push_output(std::move(end));
+        return;
+    }
+
+    // Pick io_context: use provided one, or fall back to legacy thread
+    asio::io_context* io = static_cast<asio::io_context*>(app->io_ctx_ptr);
+    if (!io) {
+        // Fallback: spawn legacy background thread
+        ChatApp* app_ptr = app;
+        std::thread t([app_ptr, history_copy]() {
+            auto push_event = [app_ptr](boost::json::object obj) {
+                app_ptr->push_output(std::move(obj));
+            };
+            std::string fr, fg;
+            callDeepSeekLegacy(history_copy, push_event, fr, fg);
+            if (!fr.empty()) {
+                std::lock_guard<std::mutex> lock(app_ptr->mtx);
+                if (app_ptr->cancelled) return;
+                boost::json::object am;
+                am["role"] = "assistant";
+                am["content"] = std::move(fr);
+                app_ptr->history.push_back(std::move(am));
+            }
+        });
+        {
+            std::lock_guard<std::mutex> lock(app->mtx);
+            if (app->stream_thread.joinable()) app->stream_thread.detach();
+            app->stream_thread = std::move(t);
+        }
+    } else {
+        // Async HTTP on io_context (zero extra threads)
+        auto stream = std::make_shared<ChatApp::AsyncDeepSeek>(*io);
+        ChatApp* app_ptr = app;
+
         auto push_event = [app_ptr](boost::json::object obj) {
             app_ptr->push_output(std::move(obj));
         };
 
-        std::string full_response, full_reasoning;
-        callDeepSeek(history_copy, push_event, full_response, full_reasoning);
+        auto on_done = [app_ptr](std::string response, std::string /*reasoning*/) {
+            if (!response.empty()) {
+                std::lock_guard<std::mutex> lock(app_ptr->mtx);
+                if (app_ptr->cancelled) return;
+                boost::json::object am;
+                am["role"] = "assistant";
+                am["content"] = std::move(response);
+                app_ptr->history.push_back(std::move(am));
+            }
+            app_ptr->current_stream.reset();
+        };
 
-        if (!full_response.empty()) {
-            std::lock_guard<std::mutex> lock(app_ptr->mtx);
-            if (app_ptr->cancelled) return;
-            boost::json::object assistant_msg;
-            assistant_msg["role"] = "assistant";
-            assistant_msg["content"] = std::move(full_response);
-            app_ptr->history.push_back(std::move(assistant_msg));
-        }
-    });
-
-    {
-        std::lock_guard<std::mutex> lock(app->mtx);
-        if (app->stream_thread.joinable())
-            app->stream_thread.detach();
-        app->stream_thread = std::move(t);
+        app->current_stream = stream;
+        stream->start("api.deepseek.com", "443",
+            boost::json::serialize(body), "Bearer " + apiKey,
+            std::move(push_event), std::move(on_done));
     }
 
-    // Push stream_start via callback so client begins polling
+    // Push stream_start immediately
     boost::json::object start;
     start["type"] = "stream_start";
     app->push_output(std::move(start));
 }
 
-// ---- Legacy helpers (for app_process) ----
-
-static boost::json::array drainPollArray(ChatApp* app)
-{
-    std::lock_guard<std::mutex> lock(app->mtx);
-    boost::json::array arr;
-    for (auto& obj : app->pending_outputs)
-        arr.push_back(std::move(obj));
-    app->pending_outputs.clear();
-
-    if (!arr.empty()) {
-        auto& last = arr[arr.size() - 1];
-        if (last.is_object()) {
-            auto& obj = last.as_object();
-            auto it = obj.find("type");
-            if (it != obj.end() && it->value().is_string() &&
-                it->value().as_string() == "stream_end")
-                app->done = true;
-        }
-    }
-    return arr;
-}
+// ---- Legacy path for app_process ----
 
 static boost::json::array handleUserMessageLegacy(ChatApp* app, const std::string& text)
 {
@@ -351,7 +622,6 @@ static boost::json::array handleUserMessageLegacy(ChatApp* app, const std::strin
         std::lock_guard<std::mutex> lock(app->mtx);
         app->history.push_back(std::move(user_msg));
     }
-
     std::vector<boost::json::object> history_copy;
     {
         std::lock_guard<std::mutex> lock(app->mtx);
@@ -365,24 +635,20 @@ static boost::json::array handleUserMessageLegacy(ChatApp* app, const std::strin
             if (app_ptr->cancelled) return;
             app_ptr->pending_outputs.push_back(std::move(obj));
         };
-
-        std::string full_response, full_reasoning;
-        callDeepSeek(history_copy, push_event, full_response, full_reasoning);
-
-        if (!full_response.empty()) {
+        std::string fr, fg;
+        callDeepSeekLegacy(history_copy, push_event, fr, fg);
+        if (!fr.empty()) {
             std::lock_guard<std::mutex> lock(app_ptr->mtx);
             if (app_ptr->cancelled) return;
-            boost::json::object assistant_msg;
-            assistant_msg["role"] = "assistant";
-            assistant_msg["content"] = std::move(full_response);
-            app_ptr->history.push_back(std::move(assistant_msg));
+            boost::json::object am;
+            am["role"] = "assistant";
+            am["content"] = std::move(fr);
+            app_ptr->history.push_back(std::move(am));
         }
     });
-
     {
         std::lock_guard<std::mutex> lock(app->mtx);
-        if (app->stream_thread.joinable())
-            app->stream_thread.detach();
+        if (app->stream_thread.joinable()) app->stream_thread.detach();
         app->stream_thread = std::move(t);
     }
 
@@ -393,7 +659,9 @@ static boost::json::array handleUserMessageLegacy(ChatApp* app, const std::strin
     return result;
 }
 
-// ---- Unified App C ABI ----
+// ============================================================
+//  C ABI
+// ============================================================
 
 extern "C"
 {
@@ -408,17 +676,29 @@ void app_destroy(void* p)
 {
     auto* app = static_cast<ChatApp*>(p);
     app->cancelled = true;
+    if (app->current_stream)
+        app->current_stream->cancel();
     if (app->stream_thread.joinable())
         app->stream_thread.detach();
     delete app;
 }
 
-// ---- Async API ----
+void app_set_output(void* p, app_output_fn cb, void* userdata)
+{
+    auto* app = static_cast<ChatApp*>(p);
+    app->output_cb = cb;
+    app->output_udata = userdata;
+}
+
+void app_set_io_context(void* p, void* io_ctx)
+{
+    auto* app = static_cast<ChatApp*>(p);
+    app->io_ctx_ptr = io_ctx;
+}
 
 void app_on_input(void* p, const char* input_json)
 {
     auto* app = static_cast<ChatApp*>(p);
-
     try {
         auto val = boost::json::parse(input_json);
         if (!val.is_object()) return;
@@ -445,21 +725,11 @@ void app_on_input(void* p, const char* input_json)
     } catch (...) {}
 }
 
-void app_set_output(void* p, app_output_fn cb, void* userdata)
-{
-    auto* app = static_cast<ChatApp*>(p);
-    app->output_cb = cb;
-    app->output_udata = userdata;
-}
-
-// ---- Legacy sync API ----
-
 char* app_process(void* p, const char* input_json)
 {
     auto* app = static_cast<ChatApp*>(p);
     boost::json::array outputs;
     std::string msg(input_json);
-
     try {
         auto val = boost::json::parse(msg);
         if (!val.is_object()) goto done;

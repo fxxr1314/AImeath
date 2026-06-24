@@ -83,8 +83,9 @@ AppModule AppModuleCache::load(const std::string& name)
 
     // Optional async symbols — NULL if app doesn't support them yet
     try {
-        m.app_on_input   = m.lib.get<void(void*,const char*)>("app_on_input");
-        m.app_set_output = m.lib.get<void(void*,app_output_fn,void*)>("app_set_output");
+        m.app_on_input        = m.lib.get<void(void*,const char*)>("app_on_input");
+        m.app_set_output      = m.lib.get<void(void*,app_output_fn,void*)>("app_set_output");
+        m.app_set_io_context   = m.lib.get<void(void*,void*)>("app_set_io_context");
     } catch (...) {
         // async API not available, will fall back to app_process
     }

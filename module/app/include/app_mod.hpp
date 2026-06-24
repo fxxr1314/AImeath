@@ -29,6 +29,7 @@ struct AppModule
     // ---- 异步 API（可选）----
     void  (*app_on_input)(void*, const char*)                   = nullptr;
     void  (*app_set_output)(void*, app_output_fn, void*)         = nullptr;
+    void  (*app_set_io_context)(void*, void*)                    = nullptr;
 
     // ---- 同步 API（遗留）----
     char* (*app_process)(void*, const char*) = nullptr;

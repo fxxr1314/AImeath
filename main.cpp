@@ -186,6 +186,8 @@ private:
         if (mod_.is_async()) {
             // 异步路径
             mod_.app_set_output(app_.get(), &Session::app_output_cb, this);
+            if (mod_.app_set_io_context)
+                mod_.app_set_io_context(app_.get(), &ws_->get_executor().context());
             mod_.app_on_input(app_.get(), first_msg_.c_str());
             do_read();
         } else {
