@@ -79,6 +79,7 @@ private:
     AppPtr          app_;
     ThreadPool*     fallback_pool_;
     asio::io_context* io_ctx_;
+    asio::strand<asio::io_context::executor_type> strand_;
     std::string     first_msg_;
 
     std::deque<std::string> write_queue_;

@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_subdirectory(module/core)
 add_subdirectory(module/app)
+add_subdirectory(module/llm)
 file(GLOB APP_DIRS CONFIGURE_DEPENDS desktop/app/*)
 foreach(dir ${APP_DIRS})
   if(EXISTS ${dir}/backend/CMakeLists.txt)

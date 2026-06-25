@@ -7,6 +7,7 @@ Session::Session(tcp::socket socket, Logger& logger,
     , cache_(cache)
     , fallback_pool_(fallback_pool)
     , io_ctx_(io_ctx)
+    , strand_(io_ctx->get_executor())
 {
     stream_.emplace(std::move(socket));
     logger_.info() << "[sess:" << this << "] new connection";
@@ -20,7 +21,7 @@ void Session::start()
 void Session::on_app_output(const char* json)
 {
     if (closing_) return;
-    asio::post(ws_->get_executor(),
+    asio::post(strand_,
         [self = shared_from_this(), s = std::string(json)]() {
             if (self->closing_) return;
             self->enqueue(std::move(s));
@@ -41,7 +42,7 @@ void Session::do_write()
     writing_ = true;
     auto self = shared_from_this();
     ws_->async_write(asio::buffer(write_queue_.front()),
-        [self](beast::error_code ec, std::size_t) {
+        asio::bind_executor(strand_, [self](beast::error_code ec, std::size_t) {
             if (ec) {
                 self->logger_.warn() << "[sess:" << self.get() << "] write error: " << ec.message();
                 self->closing_ = true;
@@ -52,20 +53,20 @@ void Session::do_write()
             }
             self->write_queue_.pop_front();
             self->do_write();
-        });
+        }));
 }
 
 void Session::do_http_read()
 {
     auto self = shared_from_this();
     http::async_read(*stream_, buf_, req_,
-        [self](beast::error_code ec, std::size_t) {
+        asio::bind_executor(strand_, [self](beast::error_code ec, std::size_t) {
             if (ec) {
                 self->logger_.warn() << "[sess:" << self.get() << "] http read error: " << ec.message();
                 return;
             }
             self->do_ws_accept();
-        });
+        }));
 }
 
 void Session::do_ws_accept()
@@ -74,7 +75,7 @@ void Session::do_ws_accept()
     stream_.reset();
     auto self = shared_from_this();
     ws_->async_accept(req_,
-        [self](beast::error_code ec) {
+        asio::bind_executor(strand_, [self](beast::error_code ec) {
             if (ec) {
                 self->logger_.warn() << "[sess:" << self.get() << "] ws accept error: " << ec.message();
                 return;
@@ -82,14 +83,14 @@ void Session::do_ws_accept()
             self->logger_.info() << "[sess:" << self.get() << "] ws upgrade ok";
             self->buf_.clear();
             self->do_read_first_msg();
-        });
+        }));
 }
 
 void Session::do_read_first_msg()
 {
     auto self = shared_from_this();
     ws_->async_read(buf_,
-        [self](beast::error_code ec, std::size_t) {
+        asio::bind_executor(strand_, [self](beast::error_code ec, std::size_t) {
             if (ec) {
                 self->logger_.warn() << "[sess:" << self.get() << "] first read error: " << ec.message();
                 return;
@@ -97,7 +98,7 @@ void Session::do_read_first_msg()
             self->first_msg_ = beast::buffers_to_string(self->buf_.data());
             self->buf_.clear();
             self->route_and_setup();
-        });
+        }));
 }
 
 void Session::route_and_setup()
@@ -161,7 +162,7 @@ void Session::do_read()
     if (closing_) return;
     auto self = shared_from_this();
     ws_->async_read(buf_,
-        [self](beast::error_code ec, std::size_t) {
+        asio::bind_executor(strand_, [self](beast::error_code ec, std::size_t) {
             if (ec) {
                 self->logger_.warn() << "[sess:" << self.get() << "] read error: " << ec.message();
                 self->closing_ = true;
@@ -169,7 +170,7 @@ void Session::do_read()
                 return;
             }
             self->on_read(ec, 0);
-        });
+        }));
 }
 
 void Session::on_read(beast::error_code /*ec*/, std::size_t /*n*/)
@@ -201,7 +202,7 @@ void Session::process_legacy(const std::string& msg)
         if (out) {
             std::string results(out);
             mod->app_free_string(out);
-            asio::post(self->ws_->get_executor(),
+            asio::post(self->strand_,
                 [self, results = std::move(results)]() {
                     try {
                         auto arr = boost::json::parse(results).as_array();
@@ -211,7 +212,7 @@ void Session::process_legacy(const std::string& msg)
                 });
         }
 
-        asio::post(self->ws_->get_executor(), [self]() {
+        asio::post(self->strand_, [self]() {
             if (self->app_is_done()) {
                 self->close_ws();
             } else {

@@ -17,18 +17,13 @@
 #include <ctime>
 
 #include <boost/asio.hpp>
-#include <boost/asio/ssl.hpp>
-#include <boost/beast/core.hpp>
-#include <boost/beast/http.hpp>
 #include <boost/json.hpp>
+
+#include "llm_client.hpp"
 
 #include "netconn.hpp"
 
 namespace asio  = boost::asio;
-namespace beast = boost::beast;
-namespace http  = beast::http;
-namespace ssl   = asio::ssl;
-using tcp = asio::ip::tcp;
 
 // ---- ChatApp state ----
 
@@ -65,9 +60,8 @@ struct ChatApp : std::enable_shared_from_this<ChatApp>
     // Async I/O context (for async HTTP)
     void* io_ctx_ptr = nullptr;
 
-    // Current async HTTP stream (shared_ptr, cancelled on destroy)
-    struct AsyncDeepSeek;
-    std::shared_ptr<AsyncDeepSeek> current_stream;
+    // Current async LLM stream (shared_ptr, cancelled on destroy)
+    std::shared_ptr<LlmClient> current_stream;
 
     bool done = false;
 
@@ -96,12 +90,21 @@ struct ChatApp : std::enable_shared_from_this<ChatApp>
         if (is_end) {
             CHAT_LOG("[chat-out]", "stream_end (round " << round << ")");
         }
-        if (output_cb) {
-            std::string s = boost::json::serialize(val);
-            output_cb(output_udata, s.c_str());
-        } else {
-            std::lock_guard<std::mutex> lock(mtx);
-            pending_outputs.push_back(val.as_object());
+        {
+            app_output_fn cb = nullptr;
+            void* udata = nullptr;
+            std::string s;
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                cb = output_cb;
+                udata = output_udata;
+                if (cb)
+                    s = boost::json::serialize(val);
+                else
+                    pending_outputs.push_back(val.as_object());
+            }
+            if (cb)
+                cb(udata, s.c_str());
         }
         if (is_end) {
             streaming = false;
@@ -111,254 +114,7 @@ struct ChatApp : std::enable_shared_from_this<ChatApp>
     }
 };
 
-// ---- Async HTTPS DeepSeek stream (zero threads) ----
 
-struct ChatApp::AsyncDeepSeek
-    : public std::enable_shared_from_this<ChatApp::AsyncDeepSeek>
-{
-    using PushFn = std::function<void(boost::json::object)>;
-    using DoneFn = std::function<void(std::string, std::string)>;
-    static constexpr auto REQUEST_TIMEOUT = std::chrono::seconds(120);
-
-    AsyncDeepSeek(asio::io_context& ioc)
-        : io_(ioc), resolver_(ioc)
-        , stream_(std::make_unique<ssl::stream<beast::tcp_stream>>(ioc, chat_ssl()))
-        , timer_(ioc)
-    {}
-
-    void start(const std::string& host, const std::string& port,
-               const std::string& body, const std::string& auth,
-               PushFn push, DoneFn done)
-    {
-        push_ = std::move(push);
-        done_ = std::move(done);
-        body_ = body;
-        auth_ = auth;
-        host_ = host;
-        port_ = port;
-
-        auto self = shared_from_this();
-        timer_.expires_after(REQUEST_TIMEOUT);
-        timer_.async_wait([self](beast::error_code ec) {
-            if (ec == asio::error::operation_aborted) return;
-            self->finish_error("request timeout after " +
-                std::to_string(REQUEST_TIMEOUT.count()) + "s");
-        });
-
-        do_resolve();
-    }
-
-    void cancel()
-    {
-        cancelled_ = true;
-        timer_.cancel();
-        resolver_.cancel();
-        beast::error_code ec;
-        stream_->lowest_layer().cancel(ec);
-    }
-
-private:
-    static ssl::context& chat_ssl()
-    {
-        static ssl::context ctx(ssl::context::tlsv12_client);
-        return ctx;
-    }
-
-    void stop_timer()
-    {
-        timer_.cancel();
-    }
-
-    asio::io_context& io_;
-    tcp::resolver resolver_;
-    std::unique_ptr<ssl::stream<beast::tcp_stream>> stream_;
-    asio::steady_timer timer_;
-    beast::flat_buffer buf_;
-    http::response_parser<http::string_body> parser_;
-    http::request<http::string_body> req_;
-
-    std::atomic<bool> cancelled_{false};
-    size_t prev_body_size_ = 0;
-    std::string leftover_;
-
-    std::string host_, port_, body_, auth_;
-    std::string full_response_, full_reasoning_;
-    PushFn push_;
-    DoneFn done_;
-
-    void do_resolve()
-    {
-        auto self = shared_from_this();
-        resolver_.async_resolve(host_, port_,
-            [self](beast::error_code ec, tcp::resolver::results_type results) {
-                if (ec) { self->finish_error(ec.message()); return; }
-                self->do_connect(results);
-            });
-    }
-
-    void do_connect(tcp::resolver::results_type results)
-    {
-        auto self = shared_from_this();
-        beast::get_lowest_layer(*stream_).expires_after(std::chrono::seconds(30));
-        beast::get_lowest_layer(*stream_).async_connect(results,
-            [self](beast::error_code ec, auto) {
-                if (ec) { self->finish_error(ec.message()); return; }
-                self->do_handshake();
-            });
-    }
-
-    void do_handshake()
-    {
-        auto self = shared_from_this();
-        stream_->async_handshake(ssl::stream_base::client,
-            [self](beast::error_code ec) {
-                if (ec) { self->finish_error(ec.message()); return; }
-                self->do_write_request();
-            });
-    }
-
-    void do_write_request()
-    {
-        req_ = {};
-        req_.method(http::verb::post);
-        req_.target("/chat/completions");
-        req_.version(11);
-        req_.set(http::field::host, host_);
-        req_.set(http::field::content_type, "application/json");
-        req_.set(http::field::connection, "close");
-        if (!auth_.empty()) req_.set(http::field::authorization, auth_);
-        req_.body() = body_;
-        req_.prepare_payload();
-
-        auto self = shared_from_this();
-        http::async_write(*stream_, req_,
-            [self](beast::error_code ec, std::size_t) {
-                if (ec) { self->finish_error(ec.message()); return; }
-                self->do_read_header();
-            });
-    }
-
-    void do_read_header()
-    {
-        auto self = shared_from_this();
-        http::async_read_header(*stream_, buf_, parser_,
-            [self](beast::error_code ec, std::size_t) {
-                if (ec) { self->finish_error(ec.message()); return; }
-                int status = self->parser_.get().result_int();
-                if (status != 200) {
-                    http::async_read(*self->stream_, self->buf_, self->parser_,
-                        [self](beast::error_code ec2, std::size_t) {
-                            std::string msg = "HTTP " + std::to_string(
-                                self->parser_.get().result_int());
-                            if (!ec2) msg += ": " + self->parser_.get().body();
-                            self->finish_error(msg);
-                        });
-                    return;
-                }
-                self->parser_.body_limit(std::numeric_limits<std::uint64_t>::max());
-                self->prev_body_size_ = 0;
-                self->do_read_body();
-            });
-    }
-
-    void do_read_body()
-    {
-        auto self = shared_from_this();
-        http::async_read_some(*stream_, buf_, parser_,
-            [self](beast::error_code ec, std::size_t) {
-                if (ec == http::error::end_of_stream) {
-                    self->drain_remaining();
-                    self->finish_success();
-                    return;
-                }
-                if (ec) { self->finish_error(ec.message()); return; }
-                self->drain_remaining();
-                if (self->parser_.is_done()) {
-                    self->finish_success();
-                } else {
-                    self->do_read_body();
-                }
-            });
-    }
-
-    void drain_remaining()
-    {
-        auto& body = parser_.get().body();
-        size_t prev = prev_body_size_;
-        prev_body_size_ = body.size();
-        if (prev < body.size()) {
-            std::string chunk = body.substr(prev);
-            process_sse(chunk);
-        }
-    }
-
-    void process_sse(const std::string& chunk)
-    {
-        leftover_ += chunk;
-        size_t pos;
-        while ((pos = leftover_.find("\n\n")) != std::string::npos) {
-            std::string event = leftover_.substr(0, pos);
-            leftover_.erase(0, pos + 2);
-            std::istringstream ss(event);
-            std::string line;
-            while (std::getline(ss, line)) {
-                if (line.rfind("data: ", 0) != 0) continue;
-                std::string data = line.substr(6);
-                if (data == "[DONE]") continue;
-                try {
-                    auto val = boost::json::parse(data);
-                    auto& choices = val.as_object().at("choices").as_array();
-                    if (choices.empty()) continue;
-                    auto& delta = choices[0].as_object().at("delta").as_object();
-
-                    if (delta.contains("reasoning_content") &&
-                        delta.at("reasoning_content").is_string()) {
-                        std::string r = delta.at("reasoning_content").as_string().c_str();
-                        if (!r.empty()) {
-                            full_reasoning_ += r;
-                            boost::json::object o;
-                            o["type"] = "reasoning";
-                            o["text"] = std::move(r);
-                            push_(std::move(o));
-                        }
-                    }
-                    if (delta.contains("content") &&
-                        delta.at("content").is_string()) {
-                        std::string c = delta.at("content").as_string().c_str();
-                        if (!c.empty()) {
-                            full_response_ += c;
-                            boost::json::object o;
-                            o["type"] = "delta";
-                            o["text"] = std::move(c);
-                            push_(std::move(o));
-                        }
-                    }
-                } catch (...) {}
-            }
-        }
-    }
-
-    void finish_success()
-    {
-        stop_timer();
-        if (cancelled_) return;
-        boost::json::object end;
-        end["type"] = "stream_end";
-        push_(std::move(end));
-        if (done_) done_(std::move(full_response_), std::move(full_reasoning_));
-    }
-
-    void finish_error(const std::string& msg)
-    {
-        stop_timer();
-        if (cancelled_) return;
-        boost::json::object end;
-        end["type"] = "stream_end";
-        if (!msg.empty()) end["msg"] = msg;
-        push_(std::move(end));
-        if (done_) done_(std::move(full_response_), std::move(full_reasoning_));
-    }
-};
 
 // ---- API key ----
 
@@ -669,31 +425,33 @@ static void handleUserMessageAsync(ChatApp* app, const std::string& text)
         // Async HTTP on io_context — route all output through push_output
         // for consistent logging and end-of-stream queue draining
         std::weak_ptr<ChatApp> weak_app = app->shared_from_this();
-        auto push_event = [weak_app](boost::json::object obj) {
+        auto push_event = [weak_app](LlmEvent ev) {
             auto self = weak_app.lock();
             if (!self) return;
+            boost::json::object obj;
+            obj["type"] = ev.type;
+            if (ev.type == "delta" || ev.type == "reasoning")
+                obj["text"] = std::move(ev.text);
+            if (!ev.msg.empty())
+                obj["msg"] = std::move(ev.msg);
             self->push_output(std::move(obj));
         };
 
-        // weak_ptr breaks potential cycle: ChatApp → AsyncDeepSeek → on_done → ChatApp
         std::weak_ptr<ChatApp> weak_self = app->shared_from_this();
         auto on_done = [weak_self](std::string response, std::string) {
             auto self = weak_self.lock();
             if (!self) return;
             if (self->cancelled) return;
-            {
-                std::lock_guard<std::mutex> lock(self->mtx);
-                if (!response.empty()) {
-                    boost::json::object am;
-                    am["role"] = "assistant";
-                    am["content"] = std::move(response);
-                    self->history.push_back(std::move(am));
-                }
-                self->current_stream.reset();
+            std::lock_guard<std::mutex> lock(self->mtx);
+            if (!response.empty()) {
+                boost::json::object am;
+                am["role"] = "assistant";
+                am["content"] = std::move(response);
+                self->history.push_back(std::move(am));
             }
         };
 
-        auto stream = std::make_shared<ChatApp::AsyncDeepSeek>(*io);
+        auto stream = std::make_shared<LlmClient>(*io);
         app->current_stream = stream;
         stream->start("api.deepseek.com", "443",
             boost::json::serialize(body), "Bearer " + apiKey,
@@ -772,8 +530,11 @@ void app_destroy(void* p)
 {
     auto* app = static_cast<ChatApp*>(p);
     app->cancelled = true;
-    app->output_cb = nullptr;
-    app->output_udata = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(app->mtx);
+        app->output_cb = nullptr;
+        app->output_udata = nullptr;
+    }
     if (app->current_stream)
         app->current_stream->cancel();
     if (app->stream_thread.joinable())
@@ -785,6 +546,7 @@ void app_destroy(void* p)
 void app_set_output(void* p, app_output_fn cb, void* userdata)
 {
     auto* app = static_cast<ChatApp*>(p);
+    std::lock_guard<std::mutex> lock(app->mtx);
     app->output_cb = cb;
     app->output_udata = userdata;
 }
