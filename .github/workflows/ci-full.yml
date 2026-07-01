@@ -21,21 +21,25 @@ jobs:
             build-essential \
             cmake \
             libboost-all-dev \
-            libssl-dev \
-            libgtest-dev \
-            libbenchmark-dev
+            libssl-dev
 
-      - name: Build Google Test & Benchmark
+      - name: Build Google Test
         run: |
-          cd /usr/src/gtest
-          sudo cmake -DCMAKE_BUILD_TYPE=Release .
-          sudo make -j$(nproc)
-          sudo cp lib/libgtest*.a /usr/lib/x86_64-linux-gnu/
-          sudo cp lib/libgtest*.a /usr/local/lib/
-          cd /usr/src/benchmark
-          sudo cmake -DCMAKE_BUILD_TYPE=Release -DBENCHMARK_ENABLE_TESTING=OFF .
-          sudo make -j$(nproc)
-          sudo make install
+          git clone --depth 1 --branch v1.14.0 https://github.com/google/googletest.git
+          cd googletest
+          cmake -DCMAKE_BUILD_TYPE=Release -B build
+          cmake --build build -j$(nproc)
+          sudo cp build/lib/libgtest*.a /usr/local/lib/
+          sudo cp -r googletest/include/gtest /usr/local/include/
+          sudo cp -r googlemock/include/gmock /usr/local/include/
+
+      - name: Build Google Benchmark
+        run: |
+          git clone --depth 1 --branch v1.8.5 https://github.com/google/benchmark.git
+          cd benchmark
+          cmake -DCMAKE_BUILD_TYPE=Release -DBENCHMARK_ENABLE_TESTING=OFF -B build
+          cmake --build build -j$(nproc)
+          sudo cmake --install build
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -44,7 +48,6 @@ jobs:
           cache: 'npm'
           cache-dependency-path: desktop/package-lock.json
 
-      # ---- Root C++ build ----
       - name: C++ cmake build (full)
         run: |
           mkdir -p build
@@ -52,13 +55,11 @@ jobs:
           cmake .. -DCMAKE_BUILD_TYPE=Release
           make -j$(nproc)
 
-      # ---- Root C++ test ----
       - name: C++ unit tests (chat_tests)
         run: |
           cd build
           LD_LIBRARY_PATH=output/lib ./output/test/chat_tests
 
-      # ---- Per-module standalone tests ----
       - name: module/core standalone test
         run: cd module/core && bash test_build.sh
 
@@ -68,7 +69,6 @@ jobs:
       - name: module/llm standalone test
         run: cd module/llm && bash test_build.sh
 
-      # ---- Frontend ----
       - name: Frontend npm install
         run: cd desktop && npm ci --ignore-scripts
 

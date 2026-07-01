@@ -15,7 +15,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ---- C++ build dependencies ----
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
@@ -23,19 +22,18 @@ jobs:
             build-essential \
             cmake \
             libboost-all-dev \
-            libssl-dev \
-            libgtest-dev
+            libssl-dev
 
       - name: Build Google Test
         run: |
-          cd /usr/src/gtest
-          sudo cmake -DCMAKE_BUILD_TYPE=Release .
-          sudo make -j$(nproc)
-          sudo cp lib/libgtest*.a /usr/lib/x86_64-linux-gnu/
-          sudo mkdir -p /usr/local/lib/cmake/GTest
-          sudo cp lib/libgtest*.a /usr/local/lib/
+          git clone --depth 1 --branch v1.14.0 https://github.com/google/googletest.git
+          cd googletest
+          cmake -DCMAKE_BUILD_TYPE=Release -B build
+          cmake --build build -j$(nproc)
+          sudo cp build/lib/libgtest*.a /usr/local/lib/
+          sudo cp -r googletest/include/gtest /usr/local/include/
+          sudo cp -r googlemock/include/gmock /usr/local/include/
 
-      # ---- Node.js (frontend) ----
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -43,7 +41,6 @@ jobs:
           cache: 'npm'
           cache-dependency-path: desktop/package-lock.json
 
-      # ---- C++ build ----
       - name: C++ cmake build
         run: |
           mkdir -p build
@@ -51,13 +48,11 @@ jobs:
           cmake .. -DCMAKE_BUILD_TYPE=Release
           make -j$(nproc)
 
-      # ---- C++ test ----
       - name: C++ unit tests
         run: |
           cd build
           LD_LIBRARY_PATH=output/lib ./output/test/chat_tests
 
-      # ---- Frontend test ----
       - name: Frontend npm install
         run: cd desktop && npm ci --ignore-scripts
 
