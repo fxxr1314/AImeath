@@ -52,6 +52,9 @@
         :disabled="!connected"
       />
       <button class="chat-send" @click="send" :disabled="!connected || !input.trim()">发送</button>
+      <button v-if="isStreaming" class="chat-stop" @click="stopStream" title="停止生成">
+        <svg viewBox="0 0 24 24" width="14" height="14"><rect x="4" y="4" width="16" height="16" rx="2" fill="currentColor"/></svg>
+      </button>
     </footer>
   </div>
 </template>
@@ -82,6 +85,7 @@ let rafPending = false
 
 const statusText = computed(() => connected.value ? '已连接' : '未连接')
 const statusClass = computed(() => connected.value ? 'status-ok' : 'status-err')
+const isStreaming = computed(() => streamingIdx.value >= 0)
 
 const msgBox = ref(null)
 
@@ -152,6 +156,27 @@ ch.onMessage((data) => {
       messages.value[streamingIdx.value].text = '⚠️ ' + data.msg
     }
     streamingIdx.value = -1
+    scrollBottom()
+  } else if (data.type === 'agent') {
+    if (data.action === 'open_app') {
+      messages.value.push({ text: '🔧 Agent 正在打开 ' + data.app + '...', isSelf: false })
+      window.parent.postMessage({
+        type: 'agent_open_app',
+        app: data.app,
+        params: data.params || data,
+      }, '*')
+    } else if (data.action === 'control_app') {
+      window.parent.postMessage({
+        type: 'agent_control_app',
+        app: data.app,
+        command: data.command || { value: data.value },
+      }, '*')
+    } else if (data.action === 'close_app') {
+      window.parent.postMessage({
+        type: 'agent_close_app',
+        app: data.app,
+      }, '*')
+    }
     scrollBottom()
   } else if (data.text !== undefined) {
     messages.value.push({ text: data.text, isSelf: false })
@@ -238,6 +263,12 @@ function send() {
   messages.value.push({ text, isSelf: true })
   input.value = ''
   scrollBottom()
+}
+
+function stopStream() {
+  ch.send({ action: 'stop' })
+  clearStream()
+  streamingIdx.value = -1
 }
 
 onMounted(() => { renderMermaidInChat() })
@@ -375,6 +406,25 @@ onBeforeUnmount(() => ch.close())
 .chat-send:disabled {
   opacity: 0.4;
   cursor: default;
+}
+
+.chat-stop {
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  background: #e81123;
+  color: #fff;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: background 0.2s;
+}
+
+.chat-stop:hover {
+  background: #c50f1f;
 }
 
 /* ---- Embed bubbles ---- */

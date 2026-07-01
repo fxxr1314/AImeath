@@ -20,6 +20,7 @@
         class="win-window"
         :class="{ 'win-minimized': win.minimized, 'win-maximized': win.maximized }"
         :style="winStyle(win)"
+        :data-wid="id"
         @mousedown="focusWindow(id)"
       >
         <div
@@ -36,7 +37,25 @@
           </div>
         </div>
         <div class="win-body">
-          <iframe :src="win.src" frameborder="0"></iframe>
+          <div class="win-sidebar" v-if="win.tabs">
+            <div
+              v-for="(tab, ti) in win.tabs"
+              :key="ti"
+              class="sidebar-tab"
+              :class="{ active: win.activeTab === ti }"
+              @click="switchTab(id, ti)"
+            >
+              <span class="tab-icon" v-html="tab.icon"></span>
+              <span class="tab-name">{{ tab.name }}</span>
+            </div>
+          </div>
+          <iframe
+            v-for="(tab, ti) in (win.tabs || [])"
+            :key="id + '-tab-' + ti"
+            :src="tab.src"
+            frameborder="0"
+            v-show="win.activeTab === ti"
+          ></iframe>
         </div>
         <template v-if="!win.maximized && !win.fixed">
           <div class="rh rh-n" @mousedown.stop="startResize(id, $event, 'n')"></div>
@@ -117,11 +136,34 @@ function iframeSrc(url) {
 }
 
 function openApp(app, opts) {
+  const silent = opts?.silent
   const count = Object.keys(windows).length
   const cascade = (count * 30) % 240
   const fixed = opts?.fixed
+
+  for (const id in windows) {
+    const w = windows[id]
+    if (w.appKey === app.url) {
+      if (!w.tabs) w.tabs = [{ name: w.name, icon: w.icon, src: w.src }]
+      const tabNum = w.tabs.length + 1
+      const tabName = opts?.tabName || `${app.name} (${tabNum})`
+      const uniqueId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+      const tabSrc = opts?.tabParams
+        ? iframeSrc(app.url + opts.tabParams + '&_t=' + uniqueId)
+        : iframeSrc(app.url + '?_t=' + uniqueId)
+      w.tabs.push({ name: tabName, icon: app.icon, src: tabSrc })
+      w.activeTab = w.tabs.length - 1
+      w.name = tabName
+      if (!silent) w.zIndex = ++zSeq
+      if (!silent && w.minimized) w.minimized = false
+      return
+    }
+  }
+
   const id = `w${winIdSeq++}`
+  const initialTab = { name: app.name, icon: app.icon, src: iframeSrc(app.url) }
   windows[id] = {
+    appKey: app.url,
     name: app.name,
     icon: app.icon,
     url: app.url,
@@ -131,9 +173,11 @@ function openApp(app, opts) {
     w: fixed ? 560 : 820,
     h: fixed ? 170 : 540,
     fixed: !!fixed,
-    zIndex: ++zSeq,
+    zIndex: silent ? 0 : ++zSeq,
     minimized: false,
     maximized: false,
+    tabs: [initialTab],
+    activeTab: 0,
   }
 }
 
@@ -175,6 +219,16 @@ function toggleWindow(id) {
   } else {
     w.zIndex = ++zSeq
   }
+}
+
+function switchTab(id, ti) {
+  const w = windows[id]
+  if (!w || !w.tabs) return
+  w.activeTab = ti
+  w.name = w.tabs[ti].name
+  w.icon = w.tabs[ti].icon
+  w.src = w.tabs[ti].src
+  w.zIndex = ++zSeq
 }
 
 function focusWindow(id) {
@@ -258,6 +312,42 @@ function onPostMessage(e) {
       icon: '<svg viewBox="0 0 48 48" width="18" height="18"><path d="M8 6h16l8 8v28H8V6z" fill="#4fc3f7"/><path d="M24 6v8h8" fill="#29b6f6"/></svg>',
       url: `/view?url=${encodeURIComponent(e.data.url)}&name=${encodeURIComponent(e.data.name)}&kind=${e.data.kind}`,
     }, e.data.kind === 'audio' ? { fixed: true } : undefined)
+  }
+  if (e.data?.type === 'agent_open_app') {
+    const appName = e.data.app
+    const appInfo = APPS[appName]?.info
+    if (appInfo) {
+      openApp({
+        name: appInfo.name,
+        icon: appInfo.icon,
+        url: `/${appName}`,
+      }, { silent: true })
+    }
+  }
+  if (e.data?.type === 'agent_control_app') {
+    const appName = e.data.app
+    for (const id in windows) {
+      if (windows[id].appKey === `/${appName}`) {
+        const iframe = document.querySelector(`.win-window[data-wid="${id}"] iframe`)
+        if (iframe && iframe.contentWindow) {
+          iframe.contentWindow.postMessage({
+            type: 'agent_input',
+            action: 'tick',
+            value: e.data.command?.value ?? 0,
+          }, '*')
+        }
+        break
+      }
+    }
+  }
+  if (e.data?.type === 'agent_close_app') {
+    const appName = e.data.app
+    for (const id in windows) {
+      if (windows[id].appKey === `/${appName}`) {
+        closeWindow(id)
+        break
+      }
+    }
   }
 }
 
@@ -471,6 +561,60 @@ body {
   width: 100%;
   height: 100%;
   border: none;
+  flex: 1;
+}
+
+/* ---- Sidebar tabs ---- */
+.win-sidebar {
+  display: flex;
+  flex-direction: column;
+  width: 160px;
+  min-width: 160px;
+  background: #1a1a2e;
+  border-right: 1px solid #333;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+
+.sidebar-tab {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  cursor: pointer;
+  color: #999;
+  font-size: 11px;
+  border-bottom: 1px solid #222;
+  transition: background 0.15s;
+}
+
+.sidebar-tab:hover {
+  background: #2a2a4a;
+  color: #ddd;
+}
+
+.sidebar-tab.active {
+  background: #2d1b4e;
+  color: #c4b5fd;
+  border-left: 3px solid #7c3aed;
+}
+
+.tab-icon {
+  display: flex;
+  align-items: center;
+  width: 16px;
+  height: 16px;
+}
+
+.tab-icon svg {
+  width: 14px;
+  height: 14px;
+}
+
+.tab-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* Resize handles */
