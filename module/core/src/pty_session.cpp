@@ -80,8 +80,10 @@ void PtySession::pushOutput(const std::string& text)
 void PtySession::write(const std::string& data)
 {
     if (m_master_fd >= 0 && !data.empty())
-        auto _ = ::write(m_master_fd, data.data(), data.size());
+    {
+        ssize_t _ = ::write(m_master_fd, data.data(), data.size());
         (void)_;
+    }
 }
 
 void PtySession::resize(int rows, int cols)
