@@ -1,7 +1,7 @@
 #include "ws_server.hpp"
 
 Session::Session(tcp::socket socket, Logger& logger,
-                 AppModuleCache& cache, ThreadPool* fallback_pool,
+                 IModuleCache& cache, ThreadPool* fallback_pool,
                  asio::io_context* io_ctx, int port)
     : logger_(logger)
     , cache_(cache)
@@ -162,16 +162,11 @@ void Session::route_and_setup()
             if (!s.empty()) {
                 app_name = std::move(s);
             } else {
-                s = jsonParseStr(val, key::TEXT);
-                if (!s.empty()) {
+                s = jsonParseStr(val, key::GAME);
+                if (!s.empty())
+                    app_name = std::move(s);
+                else
                     app_name = appname::CHAT;
-                } else {
-                    s = jsonParseStr(val, key::GAME);
-                    if (!s.empty())
-                        app_name = std::move(s);
-                    else
-                        app_name = appname::SNAKE;
-                }
             }
         }
     } catch (...) {}
@@ -290,7 +285,7 @@ void Session::close_ws()
 }
 
 Listener::Listener(asio::io_context& io, Logger& logger,
-                   AppModuleCache& cache, ThreadPool* fallback_pool,
+                   IModuleCache& cache, ThreadPool* fallback_pool,
                    int port)
     : io_(io)
     , acceptor_(io, tcp::endpoint(tcp::v4(), port))

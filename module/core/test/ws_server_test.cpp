@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "ws_server.hpp"
+#include "app_mod.hpp"
 #include <boost/asio.hpp>
 
 TEST(WsServerConstantsTest, DefaultPort)
@@ -22,11 +23,6 @@ TEST(WsServerKeyNamespaceTest, AppKey)
     EXPECT_STREQ(key::APP, "app");
 }
 
-TEST(WsServerKeyNamespaceTest, TextKey)
-{
-    EXPECT_STREQ(key::TEXT, "text");
-}
-
 TEST(WsServerKeyNamespaceTest, GameKey)
 {
     EXPECT_STREQ(key::GAME, "game");
@@ -35,11 +31,6 @@ TEST(WsServerKeyNamespaceTest, GameKey)
 TEST(WsServerAppnameNamespaceTest, ChatApp)
 {
     EXPECT_STREQ(appname::CHAT, "chat");
-}
-
-TEST(WsServerAppnameNamespaceTest, SnakeApp)
-{
-    EXPECT_STREQ(appname::SNAKE, "snake");
 }
 
 TEST(WsServerListenerTest, ConstructAndShutdown)

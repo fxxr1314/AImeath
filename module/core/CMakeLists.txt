@@ -34,7 +34,7 @@ add_library(core SHARED
     src/pty_session.cpp
 )
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(core PUBLIC OpenSSL::SSL OpenSSL::Crypto Threads::Threads Boost::url Boost::json app util)
+target_link_libraries(core PUBLIC OpenSSL::SSL OpenSSL::Crypto Threads::Threads Boost::url Boost::json util)
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 find_package(GTest REQUIRED)
@@ -50,7 +50,7 @@ add_executable(tests
     test/pty_session_test.cpp
 )
 set_target_properties(tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output/test)
-target_link_libraries(tests core GTest::GTest GTest::Main)
+target_link_libraries(tests core app GTest::GTest GTest::Main)
 target_include_directories(tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 find_package(benchmark REQUIRED)

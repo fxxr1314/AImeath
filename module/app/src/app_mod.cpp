@@ -3,13 +3,10 @@
 #include <iostream>
 #include <boost/dll.hpp>
 
-/// Try to load a shared library by name.
-/// Falls back to absolute paths relative to the executable.
 static boost::dll::shared_library try_load(const std::string& name)
 {
     std::string soname = "lib" + name + ".so";
 
-    // Retry with ec overload to avoid throwing exceptions
     auto try_one = [&](const std::string& path) -> boost::dll::shared_library {
         std::error_code ec;
         boost::dll::shared_library lib(path, ec);
@@ -17,11 +14,9 @@ static boost::dll::shared_library try_load(const std::string& name)
         return {};
     };
 
-    // Try bare name (uses LD_LIBRARY_PATH, RUNPATH, /etc/ld.so.cache, /usr/lib)
     auto lib = try_one(soname);
     if (lib) return lib;
 
-    // Build absolute paths relative to executable
     boost::system::error_code ec;
     boost::filesystem::path exe = boost::filesystem::read_symlink("/proc/self/exe", ec);
     if (ec) return {};
@@ -49,7 +44,10 @@ AppModule AppModuleCache::load(const std::string& name)
     std::lock_guard<std::mutex> lock(m_mtx);
     auto it = m_cache.find(name);
     if (it != m_cache.end())
-        return it->second;
+    {
+        it->second.mod.loaded = true;
+        return it->second.mod;
+    }
 
     auto lib = try_load(name);
     if (!lib)
@@ -59,15 +57,15 @@ AppModule AppModuleCache::load(const std::string& name)
     }
 
     AppModule m;
-    m.lib = std::move(lib);
+    m.loaded = true;
 
     try
     {
-        m.app_create      = m.lib.get<void*(const char*)>("app_create");
-        m.app_destroy     = m.lib.get<void(void*)>("app_destroy");
-        m.app_process     = m.lib.get<char*(void*,const char*)>("app_process");
-        m.app_free_string = m.lib.get<void(char*)>("app_free_string");
-        m.app_is_done     = m.lib.get<int(void*)>("app_is_done");
+        m.app_create      = lib.get<void*(const char*)>("app_create");
+        m.app_destroy     = lib.get<void(void*)>("app_destroy");
+        m.app_process     = lib.get<char*(void*,const char*)>("app_process");
+        m.app_free_string = lib.get<void(char*)>("app_free_string");
+        m.app_is_done     = lib.get<int(void*)>("app_is_done");
     }
     catch (const boost::system::system_error& e)
     {
@@ -81,16 +79,14 @@ AppModule AppModuleCache::load(const std::string& name)
         return {};
     }
 
-    // Optional async symbols — NULL if app doesn't support them yet
     try {
-        m.app_on_input        = m.lib.get<void(void*,const char*)>("app_on_input");
-        m.app_set_output      = m.lib.get<void(void*,app_output_fn,void*)>("app_set_output");
-        m.app_set_io_context   = m.lib.get<void(void*,void*)>("app_set_io_context");
+        m.app_on_input        = lib.get<void(void*,const char*)>("app_on_input");
+        m.app_set_output      = lib.get<void(void*,app_output_fn,void*)>("app_set_output");
+        m.app_set_io_context  = lib.get<void(void*,void*)>("app_set_io_context");
     } catch (...) {
-        // async API not available, will fall back to app_process
     }
 
-    m_cache[name] = m;
+    m_cache[name] = {std::move(lib), m};
     return m;
 }
 

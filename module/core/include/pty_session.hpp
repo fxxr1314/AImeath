@@ -7,7 +7,7 @@
 #include <boost/asio.hpp>
 #include <boost/noncopyable.hpp>
 
-#include "app_api.hpp"
+#include "iface_mod.hpp"
 
 class PtySession : private boost::noncopyable
 {

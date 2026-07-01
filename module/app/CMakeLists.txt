@@ -16,7 +16,7 @@ add_library(app SHARED
     src/app_mod.cpp
 )
 target_include_directories(app PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(app PRIVATE Boost::json Boost::filesystem dl)
+target_link_libraries(app PUBLIC Boost::json Boost::filesystem dl core)
 
 # ---- Mock .so for testing ----
 add_library(mock_app MODULE

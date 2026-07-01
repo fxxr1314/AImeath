@@ -4,7 +4,7 @@
  * ws_server — 异步 WebSocket 服务端基础设施
  *
  * 提供 Session（连接管理 + 路由 + 消息循环）和 Listener（async_accept）。
- * 依赖 app_mod（app 模块）、threadmgr（线程池）、logger、wsutil。
+ * 依赖 core/app_mod（模块接口）、threadmgr（线程池）、logger、wsutil。
  */
 
 #include <string>
@@ -18,7 +18,7 @@
 #include <boost/beast/websocket.hpp>
 #include <boost/json.hpp>
 
-#include "app_mod.hpp"
+#include "iface_mod.hpp"
 #include "threadmgr.hpp"
 #include "logger.hpp"
 #include "wsutil.hpp"
@@ -35,20 +35,18 @@ constexpr int DEFAULT_FALLBACK_THREADS = 4;
 
 namespace key {
     constexpr auto APP  = "app";
-    constexpr auto TEXT = "text";
     constexpr auto GAME = "game";
 }
 
 namespace appname {
     constexpr auto CHAT  = "chat";
-    constexpr auto SNAKE = "snake";
 }
 
 class Session : public std::enable_shared_from_this<Session>
 {
 public:
     Session(tcp::socket socket, Logger& logger,
-            AppModuleCache& cache, ThreadPool* fallback_pool,
+            IModuleCache& cache, ThreadPool* fallback_pool,
             asio::io_context* io_ctx, int port);
 
     void start();
@@ -75,7 +73,7 @@ private:
     http::request<http::string_body>                           req_;
 
     Logger&         logger_;
-    AppModuleCache& cache_;
+    IModuleCache& cache_;
     AppModule      mod_;
     AppPtr          app_;
     ThreadPool*     fallback_pool_;
@@ -93,7 +91,7 @@ class Listener : public std::enable_shared_from_this<Listener>
 {
 public:
     Listener(asio::io_context& io, Logger& logger,
-             AppModuleCache& cache, ThreadPool* fallback_pool,
+             IModuleCache& cache, ThreadPool* fallback_pool,
              int port = DEFAULT_PORT);
 
     int port() const { return port_; }
@@ -107,7 +105,7 @@ private:
     asio::io_context& io_;
     tcp::acceptor    acceptor_;
     Logger&          logger_;
-    AppModuleCache&  cache_;
+    IModuleCache&  cache_;
     ThreadPool*      fallback_pool_;
     int              port_;
 };

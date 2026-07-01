@@ -18,6 +18,7 @@
 #include "threadmgr.hpp"
 #include "logger.hpp"
 #include "ws_server.hpp"
+#include "app_mod.hpp"
 
 namespace asio  = boost::asio;
 namespace beast = boost::beast;
