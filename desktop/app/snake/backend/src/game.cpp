@@ -129,14 +129,5 @@ std::string SnakeGame::getState() const
     return boost::json::serialize(obj);
 }
 
-extern "C"
-{
-
-void* game_new(int w, int h)
-{
-    return new SnakeGame(w, h);
-}
-
-GAME_API_COMMON()
-
-}
+#define GAME_CLASS SnakeGame
+APP_GAME_API_COMMON()

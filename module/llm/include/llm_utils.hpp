@@ -2,6 +2,9 @@
 
 #include <boost/json.hpp>
 #include <string>
+#include <map>
+#include <vector>
+#include "llm_client.hpp"
 
 namespace llm {
 
@@ -17,6 +20,86 @@ inline std::string build_chat_body(const boost::json::array& messages,
     if (thinking)
         body["thinking"] = {{"type", "enabled"}, {"budget_tokens", 4096}};
     return boost::json::serialize(body);
+}
+
+inline boost::json::array get_default_tools()
+{
+    boost::json::array tools;
+
+    boost::json::object t1;
+    t1["type"] = "function";
+    t1["function"] = {
+        {"name", "open_app"},
+        {"description", "打开一个应用程序窗口. Use when the user asks to open or launch an app."},
+        {"parameters", {
+            {"type", "object"},
+            {"properties", {
+                {"app", {{"type","string"},{"description","应用名称, 可选: snake, gomoku, pacman, go, chat, terminal, filemanager"}}}
+            }},
+            {"required", boost::json::array{"app"}}
+        }}
+    };
+    tools.push_back(std::move(t1));
+
+    boost::json::object t2;
+    t2["type"] = "function";
+    t2["function"] = {
+        {"name", "control_app"},
+        {"description", "向已打开的应用发送操作指令. Direction values: 0=up, 1=down, 2=left, 3=right. For go: -1=pass, -2=resign."},
+        {"parameters", {
+            {"type", "object"},
+            {"properties", {
+                {"app", {{"type","string"},{"description","目标应用名称"}}},
+                {"value", {{"type","integer"},{"description","操作值"}}}
+            }},
+            {"required", boost::json::array{"app","value"}}
+        }}
+    };
+    tools.push_back(std::move(t2));
+
+    boost::json::object t3;
+    t3["type"] = "function";
+    t3["function"] = {
+        {"name", "close_app"},
+        {"description", "关闭一个已打开的应用窗口."},
+        {"parameters", {
+            {"type", "object"},
+            {"properties", {
+                {"app", {{"type","string"},{"description","要关闭的应用名称"}}}
+            }},
+            {"required", boost::json::array{"app"}}
+        }}
+    };
+    tools.push_back(std::move(t3));
+
+    return tools;
+}
+
+inline void inject_tools(std::string& body, bool with_tools)
+{
+    if (!with_tools) return;
+    auto body_json = boost::json::parse(body);
+    if (!body_json.is_object()) return;
+    body_json.as_object()["tools"] = get_default_tools();
+    body_json.as_object()["tool_choice"] = boost::json::string("auto");
+    body = boost::json::serialize(body_json);
+}
+
+inline std::map<std::string, LlmToolCall> merge_tool_calls(const std::vector<LlmToolCall>& chunks)
+{
+    std::map<std::string, LlmToolCall> merged;
+    for (auto& tc : chunks) {
+        if (tc.id.empty()) {
+            if (!merged.empty())
+                merged.rbegin()->second.function_arguments += tc.function_arguments;
+            continue;
+        }
+        auto& entry = merged[tc.id];
+        if (entry.id.empty()) entry.id = tc.id;
+        if (!tc.function_name.empty()) entry.function_name = tc.function_name;
+        entry.function_arguments += tc.function_arguments;
+    }
+    return merged;
 }
 
 } // namespace llm

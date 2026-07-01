@@ -94,14 +94,5 @@ std::string PacmanGame::getState() const
     return boost::json::serialize(obj);
 }
 
-extern "C"
-{
-
-void* game_new(int w, int h)
-{
-    return new PacmanGame(w, h);
-}
-
-GAME_API_COMMON()
-
-}
+#define GAME_CLASS PacmanGame
+APP_GAME_API_COMMON()

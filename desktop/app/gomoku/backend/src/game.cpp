@@ -104,15 +104,7 @@ std::string GomokuGame::getState() const
     return boost::json::serialize(obj);
 }
 
-extern "C"
-{
-
-void* game_new(int w, int h)
-{
-    (void)h;
-    return new GomokuGame(w);
-}
-
-GAME_API_COMMON()
-
-}
+#define GAME_CLASS GomokuGame
+#undef GAME_CONSTRUCT
+#define GAME_CONSTRUCT(w, h) new GomokuGame(w)
+APP_GAME_API_COMMON()

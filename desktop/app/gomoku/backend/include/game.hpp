@@ -30,5 +30,3 @@ private:
     bool  m_over;
     Cell  m_winner;
 };
-
-GAME_API_DECL()

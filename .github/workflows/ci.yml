@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---- C++ build dependencies ----
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential \
+            cmake \
+            libboost-all-dev \
+            libssl-dev \
+            libgtest-dev
+
+      - name: Build Google Test
+        run: |
+          cd /usr/src/gtest
+          sudo cmake -DCMAKE_BUILD_TYPE=Release .
+          sudo make -j$(nproc)
+          sudo cp lib/libgtest*.a /usr/lib/x86_64-linux-gnu/
+          sudo mkdir -p /usr/local/lib/cmake/GTest
+          sudo cp lib/libgtest*.a /usr/local/lib/
+
+      # ---- Node.js (frontend) ----
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: desktop/package-lock.json
+
+      # ---- C++ build ----
+      - name: C++ cmake build
+        run: |
+          mkdir -p build
+          cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          make -j$(nproc)
+
+      # ---- C++ test ----
+      - name: C++ unit tests
+        run: |
+          cd build
+          LD_LIBRARY_PATH=output/lib ./output/test/chat_tests
+
+      # ---- Frontend test ----
+      - name: Frontend npm install
+        run: cd desktop && npm ci --ignore-scripts
+
+      - name: Frontend vitest
+        run: cd desktop && npx vitest run

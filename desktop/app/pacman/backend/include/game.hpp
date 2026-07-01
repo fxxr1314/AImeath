@@ -4,6 +4,7 @@
 #include <game_api.hpp>
 #include "board.hpp"
 #include "direction.hpp"
+#include "direction.hpp"
 
 class PacmanGame : public Game
 {
@@ -32,5 +33,3 @@ private:
     int   m_score;
     bool  m_game_over;
 };
-
-GAME_API_DECL()

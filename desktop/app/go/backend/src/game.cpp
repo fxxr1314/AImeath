@@ -119,16 +119,7 @@ std::string GoGame::getState() const
     return boost::json::serialize(obj);
 }
 
-// ---- C API ----
-extern "C"
-{
-
-void* game_new(int w, int h)
-{
-    (void)h;
-    return new GoGame(w);
-}
-
-GAME_API_COMMON()
-
-} // extern "C"
+#define GAME_CLASS GoGame
+#undef GAME_CONSTRUCT
+#define GAME_CONSTRUCT(w, h) new GoGame(w)
+APP_GAME_API_COMMON()

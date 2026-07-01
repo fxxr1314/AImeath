@@ -17,7 +17,6 @@ find_package(Boost REQUIRED COMPONENTS json)
 find_package(OpenSSL REQUIRED)
 
 add_library(chat SHARED
-    src/chat.cpp
     src/chat_server.cpp
 )
 target_include_directories(chat PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

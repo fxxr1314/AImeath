@@ -12,7 +12,6 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output/lib)
 add_library(go SHARED
     src/board.cpp
     src/game.cpp
-    ${CMAKE_SOURCE_DIR}/desktop/app/shared/game/src/game_app_adapter.cpp
 )
 target_include_directories(go PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(go PRIVATE ${CMAKE_SOURCE_DIR}/module/app/include)

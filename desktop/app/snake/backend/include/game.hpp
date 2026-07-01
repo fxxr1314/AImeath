@@ -30,5 +30,3 @@ private:
     bool m_game_over;
     int m_score;
 };
-
-GAME_API_DECL()

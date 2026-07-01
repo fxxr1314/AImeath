@@ -19,7 +19,6 @@ add_library(snake SHARED
     src/snake.cpp
     src/board.cpp
     src/game.cpp
-    ${CMAKE_SOURCE_DIR}/desktop/app/shared/game/src/game_app_adapter.cpp
 )
 target_include_directories(snake PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(snake PRIVATE ${CMAKE_SOURCE_DIR}/module/app/include)

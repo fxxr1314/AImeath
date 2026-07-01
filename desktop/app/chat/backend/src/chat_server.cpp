@@ -44,33 +44,21 @@ static void handleUserMessageAsync(ChatApp* app, const std::string& text);
 struct ChatApp : std::enable_shared_from_this<ChatApp>
 {
     std::vector<boost::json::object> history;
-    std::vector<boost::json::object> pending_outputs; // legacy
-    MessageQueue<std::string> input_queue;            // pending messages while streaming
+    std::vector<boost::json::object> pending_outputs;
+    MessageQueue<std::string> input_queue;
     std::mutex mtx;
     std::atomic<bool> cancelled{false};
-    std::atomic<bool> streaming{false};               // true while DeepSeek request in flight
-    std::thread stream_thread;                        // legacy background thread
-    int round = 0;                                    // message round counter for logging
+    std::atomic<bool> streaming{false};
+    int round = 0;
 
-    // Async output
     app_output_fn output_cb = nullptr;
     void* output_udata = nullptr;
-
-    // Async I/O context (for async HTTP)
     void* io_ctx_ptr = nullptr;
 
-    // Current async LLM stream (shared_ptr, cancelled on destroy)
     std::shared_ptr<LlmClient> current_stream;
-
     bool done = false;
 
-    // Self-holder to manage lifetime: app_destroy releases this,
-    // but actual deletion waits until all callbacks release their weak_ptr.
     std::shared_ptr<ChatApp> self_holder;
-
-    // Tool calling support
-    std::vector<LlmToolCall> collected_tool_calls;
-    void clear_collected_tools() { collected_tool_calls.clear(); }
 
     void push_output(boost::json::value val)
     {
@@ -89,9 +77,6 @@ struct ChatApp : std::enable_shared_from_this<ChatApp>
                 else if (t == "reasoning")
                     CHAT_LOG("[chat-out]", "reasoning (round " << round << ")");
             }
-        }
-        if (is_end) {
-            CHAT_LOG("[chat-out]", "stream_end (round " << round << ")");
         }
         {
             app_output_fn cb = nullptr;
@@ -117,10 +102,7 @@ struct ChatApp : std::enable_shared_from_this<ChatApp>
     }
 };
 
-
-
 // ---- API key ----
-// L1: replaced duplicated ifstream+parse with Config::instance() singleton
 
 // ---- Command handling ----
 
@@ -172,7 +154,7 @@ static boost::json::array handleCommand(const std::string& text)
     return result;
 }
 
-// ---- Legacy sync support ----
+// ---- Poll support ----
 
 static void drainAndPush(ChatApp* app)
 {
@@ -180,16 +162,6 @@ static void drainAndPush(ChatApp* app)
     for (auto& obj : app->pending_outputs)
         app->push_output(std::move(obj));
     app->pending_outputs.clear();
-}
-
-static boost::json::array drainPollArray(ChatApp* app)
-{
-    std::lock_guard<std::mutex> lock(app->mtx);
-    boost::json::array arr;
-    for (auto& obj : app->pending_outputs)
-        arr.push_back(std::move(obj));
-    app->pending_outputs.clear();
-    return arr;
 }
 
 // ---- Process next queued message ----
@@ -209,7 +181,7 @@ static void processNextInQueue(ChatApp* app)
     handleUserMessageAsync(app, next);
 }
 
-// ---- Async path: zero-thread DeepSeek via io_context ----
+// ---- Async LLM call via shared io_context ----
 
 static void doLlmCall(ChatApp* app, const std::string& body,
                       bool withTools,
@@ -239,44 +211,24 @@ static void handleUserMessageAsync(ChatApp* app, const std::string& text)
         if (app->cancelled) return;
 
         if (!toolCalls.empty()) {
-            // Merge tool calls from streaming chunks.
-            // DeepSeek sends multiple SSE chunks per tool call:
-            //   chunk 1: {index,id,name}  chunk N: {arguments...}
-            // We must accumulate by id to avoid duplicate/empty IDs.
-            std::map<std::string, LlmToolCall> merged;
-            for (auto& tc : toolCalls) {
-                if (tc.id.empty()) {
-                    // Partial chunk — append arguments to last tool with matching index
-                    if (!merged.empty())
-                        merged.rbegin()->second.function_arguments += tc.function_arguments;
-                    continue;
-                }
-                auto& entry = merged[tc.id];
-                entry.id = tc.id;
-                if (!tc.function_name.empty())
-                    entry.function_name = tc.function_name;
-                entry.function_arguments += tc.function_arguments;
-            }
+            auto merged = llm::merge_tool_calls(toolCalls);
 
-            // Build assistant message with tool_calls
             boost::json::object am;
             am["role"] = "assistant";
-            if (!response.empty())
-                am["content"] = response;
-            if (!reasoning.empty())
-                am["reasoning_content"] = reasoning;
+            if (!response.empty()) am["content"] = response;
+            if (!reasoning.empty()) am["reasoning_content"] = reasoning;
 
             boost::json::array tcArr;
             std::vector<LlmToolCall> mergedList;
-            for (auto& [id, tc] : merged) {
-                mergedList.push_back(tc);
+            for (auto& kv : merged) {
+                mergedList.push_back(kv.second);
                 boost::json::object tcObj;
-                tcObj["id"] = tc.id;
+                tcObj["id"] = kv.second.id;
                 tcObj["type"] = "function";
-                boost::json::object fn;
-                fn["name"] = tc.function_name;
-                fn["arguments"] = tc.function_arguments;
-                tcObj["function"] = fn;
+                tcObj["function"] = {
+                    {"name", kv.second.function_name},
+                    {"arguments", kv.second.function_arguments}
+                };
                 tcArr.push_back(std::move(tcObj));
             }
             am["tool_calls"] = std::move(tcArr);
@@ -286,7 +238,6 @@ static void handleUserMessageAsync(ChatApp* app, const std::string& text)
                 app->history.push_back(std::move(am));
             }
 
-            // Execute each tool and add results
             for (auto& tc : mergedList) {
                 boost::json::object tr;
                 tr["role"] = "tool";
@@ -348,7 +299,6 @@ static void handleUserMessageAsync(ChatApp* app, const std::string& text)
                 }
             }
 
-            // Make followup call WITHOUT tools to get final text response
             std::vector<boost::json::object> hc2;
             {
                 std::lock_guard<std::mutex> lock(app->mtx);
@@ -356,9 +306,8 @@ static void handleUserMessageAsync(ChatApp* app, const std::string& text)
             }
             boost::json::array msgs2;
             for (auto& m : hc2) msgs2.push_back(m);
-            std::string body2 = llm::build_chat_body(msgs2);
+            std::string body2 = llm::build_chat_body(msgs2, "deepseek-v4-flash", true, false);
 
-            // Followup without tools
             boost::json::object start2;
             start2["type"] = "stream_start";
             app->push_output(std::move(start2));
@@ -369,24 +318,19 @@ static void handleUserMessageAsync(ChatApp* app, const std::string& text)
                     std::lock_guard<std::mutex> lock(app->mtx);
                     boost::json::object am2;
                     am2["role"] = "assistant";
-                    if (!resp2.empty())
-                        am2["content"] = resp2;
-                    if (!reason2.empty())
-                        am2["reasoning_content"] = reason2;
+                    if (!resp2.empty()) am2["content"] = resp2;
+                    if (!reason2.empty()) am2["reasoning_content"] = reason2;
                     if (!resp2.empty() || !reason2.empty())
                         app->history.push_back(std::move(am2));
                 }
             });
         } else {
-            // Normal text response — include reasoning_content for thinking mode continuity
             {
                 std::lock_guard<std::mutex> lock(app->mtx);
                 boost::json::object am;
                 am["role"] = "assistant";
-                if (!response.empty())
-                    am["content"] = response;
-                if (!reasoning.empty())
-                    am["reasoning_content"] = reasoning;
+                if (!response.empty()) am["content"] = response;
+                if (!reasoning.empty()) am["reasoning_content"] = reasoning;
                 if (!response.empty() || !reasoning.empty())
                     app->history.push_back(std::move(am));
             }
@@ -403,19 +347,7 @@ static void doLlmCall(ChatApp* app, const std::string& body,
                       std::function<void(std::string, std::string, std::vector<LlmToolCall>)> onDone)
 {
     std::string finalBody = body;
-    if (withTools) {
-        static const char* TOOLS_JSON = R"([
-            {"type":"function","function":{"name":"open_app","description":"打开一个应用程序窗口. Use when the user asks to open or launch an app.","parameters":{"type":"object","properties":{"app":{"type":"string","description":"应用名称, 可选: snake, gomoku, pacman, go, chat, terminal, filemanager"}},"required":["app"]}}},
-            {"type":"function","function":{"name":"control_app","description":"向已打开的应用发送操作指令. Direction values: 0=up, 1=down, 2=left, 3=right. For go: -1=pass, -2=resign.","parameters":{"type":"object","properties":{"app":{"type":"string","description":"目标应用名称"},"value":{"type":"integer","description":"操作值"}},"required":["app","value"]}}},
-            {"type":"function","function":{"name":"close_app","description":"关闭一个已打开的应用窗口.","parameters":{"type":"object","properties":{"app":{"type":"string","description":"要关闭的应用名称"}},"required":["app"]}}}
-        ])";
-        auto parsed = boost::json::parse(finalBody);
-        if (parsed.is_object()) {
-            parsed.as_object()["tools"] = boost::json::parse(TOOLS_JSON);
-            parsed.as_object()["tool_choice"] = boost::json::string("auto");
-            finalBody = boost::json::serialize(parsed);
-        }
-    }
+    llm::inject_tools(finalBody, withTools);
 
     std::string apiKey = Config::instance().deepSeekApiKey();
     if (apiKey.empty()) {
@@ -470,143 +402,49 @@ static void doLlmCall(ChatApp* app, const std::string& body,
             if (!self->cancelled)
                 onDone(std::move(fullResponse), std::move(fullReasoning), std::move(toolCalls));
         });
-        {
-            std::lock_guard<std::mutex> lock(app->mtx);
-            if (app->stream_thread.joinable()) app->stream_thread.detach();
-            app->stream_thread = std::move(t);
-        }
-    } else {
-        auto toolCalls = std::make_shared<std::vector<LlmToolCall>>();
+        t.detach();
+        return;
+    }
 
-        std::weak_ptr<ChatApp> weak_app = app->shared_from_this();
-        auto push_event = [weak_app, toolCalls](LlmEvent ev) {
-            auto self = weak_app.lock();
-            if (!self) return;
-            if (!ev.tool_calls.empty())
-                toolCalls->insert(toolCalls->end(), ev.tool_calls.begin(), ev.tool_calls.end());
-            boost::json::object obj;
-            obj["type"] = ev.type;
-            if (ev.type == "delta" || ev.type == "reasoning")
-                obj["text"] = std::move(ev.text);
-            if (!ev.msg.empty())
-                obj["msg"] = std::move(ev.msg);
-            if (!ev.tool_calls.empty()) {
-                boost::json::array tcArr;
-                for (auto& tc : ev.tool_calls) {
-                    boost::json::object tcObj;
-                    tcObj["id"] = tc.id;
-                    tcObj["function_name"] = tc.function_name;
-                    tcObj["function_arguments"] = tc.function_arguments;
-                    tcArr.push_back(std::move(tcObj));
-                }
-                obj["tool_calls"] = std::move(tcArr);
+    auto toolCalls = std::make_shared<std::vector<LlmToolCall>>();
+    std::weak_ptr<ChatApp> weak_app = app->shared_from_this();
+
+    auto push_event = [weak_app, toolCalls](LlmEvent ev) {
+        auto self = weak_app.lock();
+        if (!self) return;
+        if (!ev.tool_calls.empty())
+            toolCalls->insert(toolCalls->end(), ev.tool_calls.begin(), ev.tool_calls.end());
+        boost::json::object obj;
+        obj["type"] = ev.type;
+        if (ev.type == "delta" || ev.type == "reasoning")
+            obj["text"] = std::move(ev.text);
+        if (!ev.msg.empty())
+            obj["msg"] = std::move(ev.msg);
+        if (!ev.tool_calls.empty()) {
+            boost::json::array tcArr;
+            for (auto& tc : ev.tool_calls) {
+                boost::json::object tcObj;
+                tcObj["id"] = tc.id;
+                tcObj["function_name"] = tc.function_name;
+                tcObj["function_arguments"] = tc.function_arguments;
+                tcArr.push_back(std::move(tcObj));
             }
-            self->push_output(std::move(obj));
-        };
-
-        std::weak_ptr<ChatApp> weak_self = app->shared_from_this();
-        auto on_done = [weak_self, toolCalls, onDone = std::move(onDone)](std::string response, std::string reasoning, int, int) {
-            auto self = weak_self.lock();
-            if (!self || self->cancelled) return;
-            onDone(std::move(response), std::move(reasoning), std::move(*toolCalls));
-        };
-
-        auto stream = std::make_shared<LlmClient>(*io);
-        app->current_stream = stream;
-        stream->start("api.deepseek.com", "443",
-            finalBody, "Bearer " + apiKey,
-            std::move(push_event), std::move(on_done));
-    }
-}
-
-// ---- Legacy path for app_process ----
-
-static boost::json::array handleUserMessageLegacy(ChatApp* app, const std::string& text)
-{
-    boost::json::object user_msg;
-    user_msg["role"] = "user";
-    user_msg["content"] = text;
-    {
-        std::lock_guard<std::mutex> lock(app->mtx);
-        app->history.push_back(std::move(user_msg));
-    }
-    std::vector<boost::json::object> history_copy;
-    {
-        std::lock_guard<std::mutex> lock(app->mtx);
-        history_copy = app->history;
-    }
-
-    auto self = app->shared_from_this();
-    std::thread t([self, history_copy]() {
-        std::string apiKey = Config::instance().deepSeekApiKey();
-        if (apiKey.empty()) {
-            boost::json::object end;
-            end["type"] = "stream_end";
-            end["msg"]  = "missing deepseek_api_key in config.json";
-            if (!self->cancelled) self->push_output(std::move(end));
-            return;
+            obj["tool_calls"] = std::move(tcArr);
         }
+        self->push_output(std::move(obj));
+    };
 
-        boost::json::array msgs;
-        for (const auto& m : history_copy) msgs.push_back(m);
-    std::string body = llm::build_chat_body(msgs);
+    auto on_done = [weak_app, toolCalls, onDone = std::move(onDone)](std::string response, std::string reasoning, int, int) {
+        auto self = weak_app.lock();
+        if (!self || self->cancelled) return;
+        onDone(std::move(response), std::move(reasoning), std::move(*toolCalls));
+    };
 
-    static const char* TOOLS_JSON = R"([
-        {"type":"function","function":{"name":"open_app","description":"打开一个应用程序窗口. Use when the user asks to open or launch an app.","parameters":{"type":"object","properties":{"app":{"type":"string","description":"应用名称, 可选: snake, gomoku, pacman, go, chat, terminal, filemanager"}},"required":["app"]}}},
-        {"type":"function","function":{"name":"control_app","description":"向已打开的应用发送操作指令. Direction values: 0=up, 1=down, 2=left, 3=right. For go: -1=pass, -2=resign.","parameters":{"type":"object","properties":{"app":{"type":"string","description":"目标应用名称"},"value":{"type":"integer","description":"操作值"}},"required":["app","value"]}}},
-        {"type":"function","function":{"name":"close_app","description":"关闭一个已打开的应用窗口.","parameters":{"type":"object","properties":{"app":{"type":"string","description":"要关闭的应用名称"}},"required":["app"]}}}
-    ])";
-
-    {
-        auto parsed = boost::json::parse(body);
-        if (parsed.is_object()) {
-            parsed.as_object()["tools"] = boost::json::parse(TOOLS_JSON);
-            parsed.as_object()["tool_choice"] = boost::json::string("auto");
-            body = boost::json::serialize(parsed);
-        }
-    }
-
-        asio::io_context io;
-        auto client = std::make_shared<LlmClient>(io);
-        std::string full_response;
-
-        client->start("api.deepseek.com", "443", body, "Bearer " + apiKey,
-            [&](LlmEvent ev) {
-                if (self->cancelled) { client->cancel(); return; }
-                boost::json::object obj;
-                obj["type"] = ev.type;
-                if (ev.type == "delta" || ev.type == "reasoning")
-                    obj["text"] = std::move(ev.text);
-                if (!ev.msg.empty())
-                    obj["msg"] = std::move(ev.msg);
-                self->push_output(std::move(obj));
-            },
-            [&](std::string response, std::string, int, int) {
-                full_response = std::move(response);
-            });
-
-        io.run();
-
-        if (!self->cancelled && !full_response.empty()) {
-            std::lock_guard<std::mutex> lock(self->mtx);
-            if (self->cancelled) return;
-            boost::json::object am;
-            am["role"] = "assistant";
-            am["content"] = std::move(full_response);
-            self->history.push_back(std::move(am));
-        }
-    });
-    {
-        std::lock_guard<std::mutex> lock(app->mtx);
-        if (app->stream_thread.joinable()) app->stream_thread.detach();
-        app->stream_thread = std::move(t);
-    }
-
-    boost::json::array result;
-    boost::json::object start;
-    start["type"] = "stream_start";
-    result.push_back(std::move(start));
-    return result;
+    auto stream = std::make_shared<LlmClient>(*io);
+    app->current_stream = stream;
+    stream->start("api.deepseek.com", "443",
+        finalBody, "Bearer " + apiKey,
+        std::move(push_event), std::move(on_done));
 }
 
 // ============================================================
@@ -635,8 +473,6 @@ void app_destroy(void* p)
     }
     if (app->current_stream)
         app->current_stream->cancel();
-    if (app->stream_thread.joinable())
-        app->stream_thread.detach();
     app->current_stream.reset();
     app->self_holder.reset();
 }
@@ -715,7 +551,6 @@ void app_on_input(void* p, const char* input_json)
 char* app_process(void* p, const char* input_json)
 {
     auto* app = static_cast<ChatApp*>(p);
-    boost::json::array outputs;
     std::string msg(input_json);
     try {
         auto val = boost::json::parse(msg);
@@ -725,23 +560,30 @@ char* app_process(void* p, const char* input_json)
         auto action_it = obj.find("action");
         if (action_it != obj.end() && action_it->value().is_string() &&
             action_it->value().as_string() == "poll") {
-            outputs = drainPollArray(app);
-            goto done;
+            drainAndPush(app);
         }
 
         auto text_it = obj.find("text");
         if (text_it != obj.end() && text_it->value().is_string()) {
             std::string text(text_it->value().as_string());
             if (text[0] == '/') {
-                outputs = handleCommand(text);
+                auto arr = handleCommand(text);
+                for (auto& item : arr)
+                    app->push_output(std::move(item));
             } else {
-                outputs = handleUserMessageLegacy(app, text);
+                if (app->streaming)
+                    app->input_queue.push(text);
+                else {
+                    app->streaming = true;
+                    ++app->round;
+                    handleUserMessageAsync(app, text);
+                }
             }
         }
     } catch (...) {}
 
 done:
-    std::string result = boost::json::serialize(outputs);
+    std::string result = "[]";
     char* buf = static_cast<char*>(std::malloc(result.size() + 1));
     if (buf) std::memcpy(buf, result.data(), result.size() + 1);
     return buf;
@@ -757,7 +599,7 @@ int app_is_done(void* p)
     return static_cast<ChatApp*>(p)->done ? 1 : 0;
 }
 
-// ---- Test helpers (for unit test queue-drain verification) ----
+// ---- Test helpers ----
 
 int app_queue_size(void* p)
 {

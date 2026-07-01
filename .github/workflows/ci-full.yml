@@ -1,0 +1,76 @@
+name: CI Full
+
+on:
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential \
+            cmake \
+            libboost-all-dev \
+            libssl-dev \
+            libgtest-dev \
+            libbenchmark-dev
+
+      - name: Build Google Test & Benchmark
+        run: |
+          cd /usr/src/gtest
+          sudo cmake -DCMAKE_BUILD_TYPE=Release .
+          sudo make -j$(nproc)
+          sudo cp lib/libgtest*.a /usr/lib/x86_64-linux-gnu/
+          sudo cp lib/libgtest*.a /usr/local/lib/
+          cd /usr/src/benchmark
+          sudo cmake -DCMAKE_BUILD_TYPE=Release -DBENCHMARK_ENABLE_TESTING=OFF .
+          sudo make -j$(nproc)
+          sudo make install
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: desktop/package-lock.json
+
+      # ---- Root C++ build ----
+      - name: C++ cmake build (full)
+        run: |
+          mkdir -p build
+          cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          make -j$(nproc)
+
+      # ---- Root C++ test ----
+      - name: C++ unit tests (chat_tests)
+        run: |
+          cd build
+          LD_LIBRARY_PATH=output/lib ./output/test/chat_tests
+
+      # ---- Per-module standalone tests ----
+      - name: module/core standalone test
+        run: cd module/core && bash test_build.sh
+
+      - name: module/app standalone test
+        run: cd module/app && bash test_build.sh
+
+      - name: module/llm standalone test
+        run: cd module/llm && bash test_build.sh
+
+      # ---- Frontend ----
+      - name: Frontend npm install
+        run: cd desktop && npm ci --ignore-scripts
+
+      - name: Frontend vitest
+        run: cd desktop && npx vitest run
